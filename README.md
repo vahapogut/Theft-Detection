@@ -1,91 +1,99 @@
-# 🛡️ Theft Guard AI - Advanced Anti-Theft System
+# Theft Guard AI - Advanced Anti-Theft System
 
-**Theft Guard AI** is a cutting-edge security solution powered by Computer Vision and Artificial Intelligence. It detects suspicious behaviors (shoplifting, fighting, concealment) in real-time using CCTV cameras and instantly alerting security personnel via Email or Telegram.
+Theft Guard AI is a comprehensive security solution designed for retail environments. It leverages Computer Vision and Artificial Intelligence to detect suspicious behaviors such as shoplifting, fighting, and item concealment in real-time. The system processes video feeds from multiple CCTV cameras and provides instant alerts to security personnel via a modern web dashboard, Email, and Telegram.
 
-![Dashboard Overview](assets/screenshots/dashboard_1.png)
-*(Place your dashboard screenshot here)*
+## System Capabilities
 
-## 🌟 Key Features
+### 1. Advanced Theft Detection
+The core of the system is built on a multi-stage AI pipeline that runs locally:
+*   **Object Detection:** Utilizes optimized YOLOv8 models to identify person and retail objects. It can be extended with specialized models ('shoplifting.pt') to directly detect theft actions.
+*   **Behavior Analysis:** Tracks the movement of hands relative to pockets/bags to detect concealment attempts (Hand-to-Pocket gestures).
+*   **Pose Estimation:** Analyzes human skeleton points to detect suspicious postures, such as bending down in aisles or reaching into restricted areas.
 
-*   **🧠 Advanced AI Detection:**
-    *   **Shoplifting Detection:** Uses specialized YOLOv8 models to detect theft actions.
-    *   **Pose Analysis:** Analyses skeleton points (Pose Estimation) to detect "Reaching" or "Bending" anomalies.
-    *   **Concealment Tracking:** Tracks "Hand-to-Pocket" movements to identify hidden items.
-*   **👤 Facial Recognition:** Identifies VIPs or Blacklisted individuals instantly.
-*   **📊 Real-Time Dashboard:**
-    *   Live Video Feeds from multiple cameras.
-    *   Weekly Activity Graphs & Daily Event Counters.
-    *   Instant Visual Alerts on the screen.
-*   **🔔 Instant Notifications:**
-    *   **Telegram:** Receive snapshots and alerts directly to your phone.
-    *   **Email:** Detailed incident reports with images.
-*   **🔧 Easy Configuration:**
-    *   Add/Remove cameras dynamically.
-    *   Draw "Forbidden Zones" (ROI) on the screen.
-    *   Toggle heatmap and sensitivity settings.
+### 2. Facial Recognition System
+*   **Blacklist Monitoring:** Instantly identifies known offenders entered into the system database and triggers high-priority alerts.
+*   **VIP Detection:** Can be configured to recognize loyal customers or VIPs for personalized service.
 
-## 🚀 Installation
+### 3. Real-Time Surveillance Dashboard
+built with Next.js, the dashboard offers a centralized control room experience:
+*   **Live Video Feeds:** Stream vertically or horizontally from multiple camera sources (USB or IP Cameras) simultaneously via WebSockets.
+*   **Dynamic Graphs:** Visualizes weekly and daily alert statistics to track security trends over time.
+*   **Visual Alerts:** Flashing on-screen notifications highlight the camera and timestamp of any detected event.
+
+![Dashboard Main View](assets/screenshots/dashboard_1.png)
+
+### 4. Alert History & Evidence
+*   **Event Logging:** Every detection is saved to a local SQLite database with a timestamp, alert type, and confidence score.
+*   **Snapshot Capture:** High-resolution images of the event are automatically saved for evidence.
+*   **History Viewer:** Browse past alerts, view snapshots, and export data directly from the interface.
+
+![Alert History](assets/screenshots/dashboard_2.png)
+
+### 5. Remote Notifications
+Stay informed even when away from the desk:
+*   **Telegram Integration:** Sends an instant photo and caption to a specified Telegram Chat ID via Bot API.
+*   **Email Reports:** Dispatches detailed text alerts to configured email addresses using SMTP.
+
+### 6. Customizable Security Zones
+*   **Region of Interest (ROI):** Users can draw custom polygons on the camera feed to define sensitive areas (e.g., cash registers, high-value shelves).
+*   **Zone-Specific Rules:** Detection sensitivity can be adjusted based on whether a person is inside or outside these zones.
+
+![ROI and Settings](assets/screenshots/settings.png)
+
+## Technical Architecture
+
+*   **Backend:** Python, FastAPI, OpenCV, Ultralytics YOLOv8, Face Recognition, Albumentations
+*   **Frontend:** Next.js 14, React, Tailwind CSS, Recharts, Lucide React
+*   **Database:** SQLite (Lightweight, local storage for events and faces)
+*   **Communication:** WebSockets (Real-time data), SMTP (Email), HTTPS (Telegram API)
+
+## Installation Guide
 
 ### Prerequisites
-*   Python 3.9+
-*   Node.js & npm
-*   CUDA-enabled GPU (Recommended for faster inference)
+*   Python 3.9 or higher
+*   Node.js (LTS version)
+*   NVIDIA GPU with CUDA (Recommended for real-time performance)
 
-### 1. Backend Setup
+### 1. Backend Configuration
+Clone the repository and install the required Python packages:
+
 ```bash
-# Clone the repository
 git clone https://github.com/Start-Up-Vahap/Theft-Detection.git
 cd Theft-Detection
-
-# Install Python dependencies
 pip install -r requirements.txt
-
-# (Optional) Download specialized model
-# Place 'shoplifting.pt' in the root directory. 
-# Defaults to 'yolov8n.pt' with smart filtering if not found.
 ```
 
-### 2. Frontend Setup
+If you have a specialized model (shoplifting.pt), place it in the root directory. Otherwise, the system defaults to the standard YOLOv8 model with behavior logic.
+
+### 2. Dashboard Setup
+Navigate to the dashboard directory and install dependencies:
+
 ```bash
 cd dashboard
 npm install
 ```
 
-## 💻 Usage
+## Usage
 
-### One-Click Start
-Run the `start_system.bat` file. It will automatically:
-1.  Start the Python Backend API.
-2.  Launch the Next.js Dashboard.
-3.  Open your browser to the control panel.
+### Auto-Start
+Simply run the helper script to launch both services:
+```bash
+start_system.bat
+```
 
-### Manual Start
-**Backend:**
+### Manual Startup
+**Start Backend API:**
 ```bash
 py backend.py
 ```
 
-**Frontend:**
+**Start Frontend UI:**
 ```bash
 cd dashboard
 npm run dev
 ```
 
-## 📸 Screenshots
+Open your browser and navigate to `http://localhost:3000`.
 
-| Dashboard | Alert History |
-|-----------|---------------|
-| ![Dashboard](assets/screenshots/dashboard_1.png) | ![Alerts](assets/screenshots/dashboard_2.png) |
-
-| Settings | Mobile View |
-|----------|-------------|
-| ![Settings](assets/screenshots/settings.png) | ![Mobile](assets/screenshots/mobile.png) |
-
-## 🛠️ Tech Stack
-*   **Core:** Python, OpenCV, YOLOv8 (Ultralytics), Face Recognition
-*   **Backend:** FastAPI, WebSockets, SQLite
-*   **Frontend:** Next.js 14, React, Tailwind CSS, Recharts
-*   **Communication:** SMTP (Email), Telegram Bot API
-
-## 📜 License
-This project is licensed under the MIT License.
+## License
+This project is open-source and available under the MIT License.
