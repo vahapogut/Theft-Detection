@@ -1,0 +1,13 @@
+{
+    "emailEnabled": false,
+    "smtpServer": "smtp.gmail.com",
+    "smtpPort": "587",
+    "senderEmail": "",
+    "senderPassword": "",
+    "receiverEmail": "",
+    "telegramEnabled": false,
+    "telegramBotToken": "",
+    "telegramChatId": "",
+    "roiPoints": [],
+    "showHeatmap": true
+}
