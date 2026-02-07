@@ -14,7 +14,9 @@ The core of the system is built on a multi-stage AI pipeline that runs locally:
 *   **Blacklist Monitoring:** Instantly identifies known offenders entered into the system database and triggers high-priority alerts.
 *   **VIP Detection:** Can be configured to recognize loyal customers or VIPs for personalized service.
 
+
 ### 3. Real-Time Surveillance Dashboard
+![Dashboard Overview](docs/dashboard_overview.png)
 built with Next.js, the dashboard offers a centralized control room experience:
 *   **Live Video Feeds:** Stream vertically or horizontally from multiple camera sources (USB or IP Cameras) simultaneously via WebSockets.
 *   **Dynamic Graphs:** Visualizes weekly and daily alert statistics to track security trends over time.
@@ -23,6 +25,7 @@ built with Next.js, the dashboard offers a centralized control room experience:
 
 
 ### 4. Alert History & Evidence
+![Alert History](docs/alert_history.png)
 *   **Event Logging:** Every detection is saved to a local SQLite database with a timestamp, alert type, and confidence score.
 *   **Snapshot Capture:** High-resolution images of the event are automatically saved for evidence.
 *   **History Viewer:** Browse past alerts, view snapshots, and export data directly from the interface.
@@ -32,9 +35,12 @@ built with Next.js, the dashboard offers a centralized control room experience:
 ### 5. Remote Notifications
 Stay informed even when away from the desk:
 *   **Telegram Integration:** Sends an instant photo and caption to a specified Telegram Chat ID via Bot API.
+![Telegram Settings](docs/telegram_settings.png)
 *   **Email Reports:** Dispatches detailed text alerts to configured email addresses using SMTP.
+![Email Settings](docs/email_settings.png)
 
 ### 6. Customizable Security Zones
+
 *   **Region of Interest (ROI):** Users can draw custom polygons on the camera feed to define sensitive areas (e.g., cash registers, high-value shelves).
 *   **Zone-Specific Rules:** Detection sensitivity can be adjusted based on whether a person is inside or outside these zones.
 
