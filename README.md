@@ -101,9 +101,18 @@ npm run dev
 
 Open your browser and navigate to `http://localhost:3000`.
 
-## License
-This project is open-source and available under the MIT License.
+## Contributing / Katkıda Bulunma
+
+1. Fork this repository.
+2. Create a feature branch ( `git checkout -b feature/NewFeature` ).
+3. Commit your changes ( `git commit -m 'Add new feature'` ).
+4. Push to the branch ( `git push origin feature/NewFeature` ).
+5. Open a Pull Request.
+
+## License / Lisans
+
+Distributed under the MIT License. See `LICENSE` for more information.
 
 ____________________________________________________________________
 
-Developer : Abdulvahap Öğüt
+*Developer: Abdulvahap Öğüt*
