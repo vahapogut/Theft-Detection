@@ -20,12 +20,15 @@ built with Next.js, the dashboard offers a centralized control room experience:
 *   **Dynamic Graphs:** Visualizes weekly and daily alert statistics to track security trends over time.
 *   **Visual Alerts:** Flashing on-screen notifications highlight the camera and timestamp of any detected event.
 
+
+
 ![Dashboard Main View](assets/screenshots/dashboard_1.png)
 
 ### 4. Alert History & Evidence
 *   **Event Logging:** Every detection is saved to a local SQLite database with a timestamp, alert type, and confidence score.
 *   **Snapshot Capture:** High-resolution images of the event are automatically saved for evidence.
 *   **History Viewer:** Browse past alerts, view snapshots, and export data directly from the interface.
+
 
 ![Alert History](assets/screenshots/dashboard_2.png)
 
@@ -37,6 +40,7 @@ Stay informed even when away from the desk:
 ### 6. Customizable Security Zones
 *   **Region of Interest (ROI):** Users can draw custom polygons on the camera feed to define sensitive areas (e.g., cash registers, high-value shelves).
 *   **Zone-Specific Rules:** Detection sensitivity can be adjusted based on whether a person is inside or outside these zones.
+
 
 ![ROI and Settings](assets/screenshots/settings.png)
 
@@ -95,5 +99,19 @@ npm run dev
 
 Open your browser and navigate to `http://localhost:3000`.
 
+## 📸 Screenshots
+
+| Dashboard | Alert History |
+|-----------|---------------|
+| ![Dashboard](assets/screenshots/dashboard_1.png) | ![Alerts](assets/screenshots/dashboard_2.png) |
+
+| Settings | Mobile View |
+|----------|-------------|
+| ![Settings](assets/screenshots/settings.png) | ![Mobile](assets/screenshots/mobile.png) |
+
 ## License
 This project is open-source and available under the MIT License.
+
+____________________________________________________________________
+
+Developer : Abdulvahap Öğüt
