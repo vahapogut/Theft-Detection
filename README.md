@@ -22,15 +22,12 @@ built with Next.js, the dashboard offers a centralized control room experience:
 
 
 
-![Dashboard Main View](assets/screenshots/dashboard_1.png)
-
 ### 4. Alert History & Evidence
 *   **Event Logging:** Every detection is saved to a local SQLite database with a timestamp, alert type, and confidence score.
 *   **Snapshot Capture:** High-resolution images of the event are automatically saved for evidence.
 *   **History Viewer:** Browse past alerts, view snapshots, and export data directly from the interface.
 
 
-![Alert History](assets/screenshots/dashboard_2.png)
 
 ### 5. Remote Notifications
 Stay informed even when away from the desk:
@@ -42,7 +39,6 @@ Stay informed even when away from the desk:
 *   **Zone-Specific Rules:** Detection sensitivity can be adjusted based on whether a person is inside or outside these zones.
 
 
-![ROI and Settings](assets/screenshots/settings.png)
 
 ## Technical Architecture
 
@@ -98,16 +94,6 @@ npm run dev
 ```
 
 Open your browser and navigate to `http://localhost:3000`.
-
-## 📸 Screenshots
-
-| Dashboard | Alert History |
-|-----------|---------------|
-| ![Dashboard](assets/screenshots/dashboard_1.png) | ![Alerts](assets/screenshots/dashboard_2.png) |
-
-| Settings | Mobile View |
-|----------|-------------|
-| ![Settings](assets/screenshots/settings.png) | ![Mobile](assets/screenshots/mobile.png) |
 
 ## License
 This project is open-source and available under the MIT License.
