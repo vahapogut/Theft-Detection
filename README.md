@@ -101,7 +101,7 @@ npm run dev
 
 Open your browser and navigate to `http://localhost:3000`.
 
-## Contributing / Katkıda Bulunma
+## Contributing 
 
 1. Fork this repository.
 2. Create a feature branch ( `git checkout -b feature/NewFeature` ).
@@ -109,7 +109,7 @@ Open your browser and navigate to `http://localhost:3000`.
 4. Push to the branch ( `git push origin feature/NewFeature` ).
 5. Open a Pull Request.
 
-## License / Lisans
+## License 
 
 Distributed under the MIT License. See `LICENSE` for more information.
 
