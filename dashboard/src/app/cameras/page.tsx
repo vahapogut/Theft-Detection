@@ -1,510 +1,1072 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { Camera, Plus, Trash2, Edit, Loader2, AlertCircle, CheckCircle, X, RefreshCw, HelpCircle } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  AlertCircle,
+  Camera,
+  CheckCircle,
+  Edit,
+  Loader2,
+  Plus,
+  RefreshCw,
+  Save,
+  Shield,
+  Trash2,
+  X,
+} from "lucide-react";
+import { useAuth } from "@/components/AuthProvider";
+import { apiFetch, wsUrl } from "@/lib/api";
 
+type Point = [number, number];
+type Polygon = Point[];
+interface DetectionRules {
+  confidence: number;
+  loitering_seconds: number;
+  cooldown_seconds: number;
+  inertia_frames: number;
+  loitering_enabled: boolean;
+  intrusion_enabled: boolean;
+  concealment_enabled: boolean;
+  bending_enabled: boolean;
+}
+interface Zone {
+  id: string;
+  name: string;
+  kind: "restricted" | "loitering";
+  points: Polygon;
+  loitering_seconds: number;
+}
 interface CameraData {
   id: string;
   name: string;
   source: string;
-  status: "active" | "error";
-  roi_points: number[][];
+  status: "active" | "connecting" | "reconnecting" | "error" | "stopped";
+  last_frame_at: string | null;
+  reconnect_attempts: number;
+  fps: number;
+  error: string | null;
+  roi_points: Polygon;
+  detection: Partial<DetectionRules>;
+  zones: Zone[];
+  privacy_masks: Polygon[];
 }
-
 interface CameraFeed {
   camera_id: string;
-  name: string;
   data: string;
+}
+type Notice = { text: string; type: "success" | "error" };
+type DrawingTarget = { kind: "roi" } | { kind: "zone" | "mask"; index: number };
+const DEFAULT_RULES: DetectionRules = {
+  confidence: 0.35,
+  loitering_seconds: 5,
+  cooldown_seconds: 3,
+  inertia_frames: 3,
+  loitering_enabled: true,
+  intrusion_enabled: true,
+  concealment_enabled: true,
+  bending_enabled: true,
+};
+const inputClass =
+  "w-full bg-black/40 border border-glass-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand disabled:opacity-60";
+const buttonClass =
+  "inline-flex items-center justify-center gap-2 rounded-lg border border-glass-border px-3 py-2 text-sm hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed";
+
+async function responseError(response: Response, fallback: string) {
+  const data = await response.json().catch(() => null);
+  return typeof data?.detail === "string" ? data.detail : fallback;
+}
+function errorText(error: unknown) {
+  return error instanceof Error
+    ? error.message
+    : "Connection failed. Please try again.";
+}
+function NoticeBanner({ notice }: { notice: Notice }) {
+  return (
+    <div
+      role={notice.type === "error" ? "alert" : "status"}
+      className={`rounded-lg border p-3 flex gap-2 text-sm ${notice.type === "error" ? "text-danger border-danger/30 bg-danger/10" : "text-green-400 border-green-500/30 bg-green-500/10"}`}
+    >
+      {notice.type === "error" ? (
+        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+      ) : (
+        <CheckCircle className="w-4 h-4 shrink-0 mt-0.5" />
+      )}
+      {notice.text}
+    </div>
+  );
 }
 
 export default function CamerasPage() {
+  const { canAdmin } = useAuth();
   const [cameras, setCameras] = useState<CameraData[]>([]);
   const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
-
-  // Add Camera Form
+  const [loadError, setLoadError] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [name, setName] = useState("");
   const [source, setSource] = useState("");
-
-  // ROI Canvas Drawer Modal States
   const [selectedCam, setSelectedCam] = useState<CameraData | null>(null);
-  const [roiPoints, setRoiPoints] = useState<number[][]>([]);
-  const [activeFrameBase64, setActiveFrameBase64] = useState<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
-  const fetchCameras = async () => {
-    try {
-      const res = await fetch(`${apiBaseUrl}/cameras`);
-      if (res.ok) {
-        const data = await res.json();
-        setCameras(data);
-      }
-    } catch (err) {
-      console.error("Error fetching cameras:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchCameras();
+  const fetchCameras = useCallback((signal?: AbortSignal) => {
+    return apiFetch("/cameras", { signal })
+      .then(async (response) => {
+        if (!response.ok)
+          throw new Error(
+            await responseError(response, "Could not load camera status."),
+          );
+        return response.json() as Promise<CameraData[]>;
+      })
+      .then((data) => {
+        if (!signal?.aborted) {
+          setCameras(data);
+          setLoadError("");
+        }
+      })
+      .catch((error) => {
+        if (!signal?.aborted) setLoadError(errorText(error));
+      })
+      .finally(() => {
+        if (!signal?.aborted) setLoading(false);
+      });
   }, []);
 
-  // Listen to live camera frames when ROI Modal is open
   useEffect(() => {
-    if (!selectedCam) {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      setActiveFrameBase64(null);
-      return;
-    }
-
-    const wsUrl = apiBaseUrl.replace("http", "ws") + "/ws";
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    ws.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(event.data);
-        if (payload.type === "multi_frame" && payload.cameras) {
-          const matched = payload.cameras.find((c: CameraFeed) => c.camera_id === selectedCam.id);
-          if (matched) {
-            setActiveFrameBase64(matched.data);
-          }
-        }
-      } catch (err) {
-        console.error("Error parsing WS in ROI modal", err);
-      }
-    };
-
-    return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
-    };
-  }, [selectedCam]);
-
-  // Redraw Canvas when points or frames change
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    // Clear canvas
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    const drawCanvas = () => {
-      // 1. Draw live camera frame OR placeholder background
-      if (activeFrameBase64) {
-        const img = new Image();
-        img.src = `data:image/jpeg;base64,${activeFrameBase64}`;
-        img.onload = () => {
-          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          drawPolygon();
-        };
-      } else {
-        // Dark placeholder
-        ctx.fillStyle = "#151824";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        
-        ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
-        ctx.font = "20px var(--font-geist-sans), sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillText("Surveillance Feed Loading...", canvas.width / 2, canvas.height / 2 - 10);
-        ctx.font = "14px var(--font-geist-sans), sans-serif";
-        ctx.fillText("(Ensure backend is active & transmitting live stream)", canvas.width / 2, canvas.height / 2 + 20);
-        
-        drawPolygon();
-      }
-    };
-
-    const drawPolygon = () => {
-      if (roiPoints.length === 0) return;
-
-      // Draw lines
-      ctx.beginPath();
-      ctx.moveTo(roiPoints[0][0], roiPoints[0][1]);
-      for (let i = 1; i < roiPoints.length; i++) {
-        ctx.lineTo(roiPoints[i][0], roiPoints[i][1]);
-      }
-      
-      // Close path visually
-      ctx.closePath();
-
-      // Style polygon fill & border
-      ctx.fillStyle = "rgba(59, 130, 246, 0.25)";
-      ctx.fill();
-      ctx.strokeStyle = "#3b82f6";
-      ctx.lineWidth = 3;
-      ctx.stroke();
-
-      // Draw anchor points
-      roiPoints.forEach((pt, index) => {
-        ctx.beginPath();
-        ctx.arc(pt[0], pt[1], 6, 0, 2 * Math.PI);
-        ctx.fillStyle = "#ffffff";
-        ctx.fill();
-        ctx.strokeStyle = "#3b82f6";
-        ctx.lineWidth = 2;
-        ctx.stroke();
-        
-        // Point labels
-        ctx.fillStyle = "#ffffff";
-        ctx.font = "bold 12px sans-serif";
-        ctx.fillText((index + 1).toString(), pt[0] + 10, pt[1] - 5);
-      });
-    };
-
-    drawCanvas();
-  }, [roiPoints, activeFrameBase64, selectedCam]);
-
-  const handleAddCamera = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name || !source) {
-      setMessage({ text: "Please enter a name and source value.", type: "error" });
-      return;
-    }
-
-    setSubmitting(true);
-    setMessage(null);
-
-    try {
-      const res = await fetch(`${apiBaseUrl}/cameras`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, source }),
-      });
-      const data = await res.json();
-
-      if (res.ok) {
-        setMessage({ text: "Camera added successfully!", type: "success" });
-        setName("");
-        setSource("");
-        await fetchCameras();
-      } else {
-        setMessage({ text: data.detail || "Failed to add camera.", type: "error" });
-      }
-    } catch (err) {
-      console.error(err);
-      setMessage({ text: "Connection error. Make sure backend is running.", type: "error" });
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const handleDeleteCamera = async (id: string) => {
-    if (!confirm("Are you sure you want to delete this camera stream?")) return;
-    setMessage(null);
-
-    try {
-      const res = await fetch(`${apiBaseUrl}/cameras/${id}`, {
-        method: "DELETE",
-      });
-      const data = await res.json();
-
-      if (res.ok) {
-        setMessage({ text: "Camera deleted successfully.", type: "success" });
-        await fetchCameras();
-      } else {
-        setMessage({ text: data.detail || "Failed to delete camera.", type: "error" });
-      }
-    } catch (err) {
-      console.error(err);
-      setMessage({ text: "Connection error.", type: "error" });
-    }
-  };
-
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    
-    const rect = canvas.getBoundingClientRect();
-    // Scale standard mouse clicks exactly to 1280x720 video frames
-    const x = Math.round((e.clientX - rect.left) * (canvas.width / rect.width));
-    const y = Math.round((e.clientY - rect.top) * (canvas.height / rect.height));
-
-    setRoiPoints(prev => [...prev, [x, y]]);
-  };
-
-  const clearRoiPoints = () => {
-    setRoiPoints([]);
-  };
-
-  const openRoiModal = (cam: CameraData) => {
-    setSelectedCam(cam);
-    setRoiPoints(cam.roi_points || []);
-  };
-
-  const handleSaveRoi = async () => {
-    if (!selectedCam) return;
-    try {
-      const res = await fetch(`${apiBaseUrl}/cameras/${selectedCam.id}/roi`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ points: roiPoints }),
-      });
-      const data = await res.json();
-
-      if (res.ok && data.status === "success") {
-        setMessage({ text: "Region of Interest (ROI) coordinates saved successfully!", type: "success" });
-        setSelectedCam(null);
-        await fetchCameras();
-      } else {
-        alert(data.detail || "Failed to save ROI.");
-      }
-    } catch (err) {
-      console.error(err);
-      alert("Network error while saving ROI.");
-    }
-  };
-
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-[60vh]">
-        <Loader2 className="w-8 h-8 animate-spin text-brand" />
-      </div>
+    const controller = new AbortController();
+    void fetchCameras(controller.signal);
+    const interval = setInterval(
+      () => void fetchCameras(controller.signal),
+      10_000,
     );
+    return () => {
+      controller.abort();
+      clearInterval(interval);
+    };
+  }, [fetchCameras]);
+
+  async function addCamera(event: React.FormEvent) {
+    event.preventDefault();
+    if (!canAdmin || !name.trim() || !source.trim()) return;
+    setBusy("add");
+    setNotice(null);
+    try {
+      const response = await apiFetch("/cameras", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim(), source: source.trim() }),
+      });
+      if (!response.ok)
+        throw new Error(await responseError(response, "Could not add camera."));
+      setName("");
+      setSource("");
+      setNotice({
+        type: "success",
+        text: "Camera saved. Its connection status is shown below; offline cameras are retained for automatic reconnection.",
+      });
+      await fetchCameras();
+    } catch (error) {
+      setNotice({ type: "error", text: errorText(error) });
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function cameraAction(
+    camera: CameraData,
+    action: "reconnect" | "delete",
+  ) {
+    if (!canAdmin) return;
+    if (
+      action === "delete" &&
+      !confirm(`Remove camera “${camera.name}” and its rules?`)
+    )
+      return;
+    setBusy(camera.id);
+    setNotice(null);
+    try {
+      const response = await apiFetch(
+        `/cameras/${encodeURIComponent(camera.id)}${action === "reconnect" ? "/reconnect" : ""}`,
+        { method: action === "reconnect" ? "POST" : "DELETE" },
+      );
+      if (!response.ok)
+        throw new Error(
+          await responseError(response, `Could not ${action} camera.`),
+        );
+      setNotice({
+        type: "success",
+        text:
+          action === "reconnect"
+            ? "Reconnection requested. Status refreshes every 10 seconds."
+            : "Camera removed.",
+      });
+      await fetchCameras();
+    } catch (error) {
+      setNotice({ type: "error", text: errorText(error) });
+    } finally {
+      setBusy(null);
+    }
   }
 
   return (
-    <div className="max-w-6xl mx-auto pb-10">
-      <header className="mb-8">
-        <h2 className="text-3xl font-bold tracking-tight mb-2">Camera Setup & Configuration</h2>
+    <div className="max-w-6xl mx-auto pb-10 space-y-6">
+      <header>
+        <h2 className="text-3xl font-bold tracking-tight mb-2">
+          Cameras & Detection Rules
+        </h2>
         <p className="text-foreground/60">
-          Manage dynamic USB index/RTSP streams and define camera-specific Regions of Interest (ROI) interactively.
+          Monitor connection health, define zones, and tune each camera. Health
+          refreshes every 10 seconds.
         </p>
       </header>
-
-      {message && (
-        <div 
-          className={`mb-6 p-4 rounded-lg flex items-center gap-3 border ${
-            message.type === "success" 
-              ? "bg-green-500/10 border-green-500/30 text-green-400" 
-              : "bg-danger/10 border-danger/30 text-danger"
-          }`}
-        >
-          {message.type === "success" ? <CheckCircle className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
-          <span className="text-sm font-medium">{message.text}</span>
-        </div>
+      {notice && <NoticeBanner notice={notice} />}
+      {loadError && (
+        <NoticeBanner
+          notice={{
+            type: "error",
+            text: `${loadError} Displayed camera status may be outdated.`,
+          }}
+        />
       )}
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Add Camera Form */}
-        <div className="lg:col-span-1">
-          <div className="glass-panel p-6 sticky top-6">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="p-2 rounded bg-brand/20 text-brand">
-                <Camera className="w-5 h-5" />
-              </div>
-              <h3 className="text-xl font-semibold">Connect New Camera</h3>
-            </div>
-
-            <form onSubmit={handleAddCamera} className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-foreground/80">Camera Name</label>
-                <input 
-                  type="text" 
+      <div className={`grid gap-6 ${canAdmin ? "lg:grid-cols-3" : ""}`}>
+        {canAdmin && (
+          <section className="glass-panel p-6 h-fit">
+            <h3 className="text-xl font-semibold flex items-center gap-2 mb-5">
+              <Camera className="w-5 h-5 text-brand" />
+              Add Camera
+            </h3>
+            <form onSubmit={addCamera} className="space-y-4">
+              <label className="block text-sm space-y-2">
+                <span>Camera name</span>
+                <input
+                  className={inputClass}
                   value={name}
-                  onChange={e => setName(e.target.value)}
-                  placeholder="e.g. Checkout Desk A"
-                  className="w-full bg-black/40 border border-glass-border rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand text-foreground placeholder:text-foreground/30"
+                  onChange={(event) => setName(event.target.value)}
+                  placeholder="Checkout desk"
+                  maxLength={100}
                   required
                 />
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex justify-between items-center">
-                  <label className="text-sm font-medium text-foreground/80">Input Source</label>
-                  <span className="text-[10px] text-foreground/45 flex items-center gap-1">
-                    <HelpCircle className="w-3 h-3" />
-                    Webcam index or RTSP url
-                  </span>
-                </div>
-                <input 
-                  type="text" 
+              </label>
+              <label className="block text-sm space-y-2">
+                <span>Camera source</span>
+                <input
+                  className={inputClass}
                   value={source}
-                  onChange={e => setSource(e.target.value)}
-                  placeholder="e.g. 0 or rtsp://username:pwd@ip:port/h264"
-                  className="w-full bg-black/40 border border-glass-border rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand text-foreground placeholder:text-foreground/30"
+                  onChange={(event) => setSource(event.target.value)}
+                  placeholder="0 or rtsp://camera/stream"
+                  autoComplete="off"
                   required
                 />
-              </div>
-
-              <button 
-                type="submit" 
-                disabled={submitting}
-                className="w-full mt-4 flex items-center justify-center gap-2 bg-brand hover:bg-brand/90 disabled:opacity-50 text-white py-2 rounded-lg font-medium transition-colors cursor-pointer"
+              </label>
+              <p className="text-xs text-foreground/50">
+                Use a USB camera index or network stream URL. Credentials are
+                hidden in the camera list.
+              </p>
+              <button
+                className={`${buttonClass} w-full bg-brand text-white`}
+                disabled={busy !== null}
+                type="submit"
               >
-                {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
-                {submitting ? "Connecting stream..." : "Add Camera Stream"}
+                {busy === "add" ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Plus className="w-4 h-4" />
+                )}
+                Add Camera
               </button>
             </form>
+          </section>
+        )}
+        <section
+          className={`glass-panel p-6 ${canAdmin ? "lg:col-span-2" : ""}`}
+        >
+          <div className="flex items-center justify-between gap-3 mb-5">
+            <h3 className="text-xl font-semibold">
+              Configured Cameras{" "}
+              <span className="text-sm text-foreground/50">
+                ({cameras.length})
+              </span>
+            </h3>
+            <button
+              className={buttonClass}
+              onClick={() => void fetchCameras()}
+              aria-label="Refresh camera health"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
           </div>
-        </div>
-
-        {/* Cameras List */}
-        <div className="lg:col-span-2">
-          <div className="glass-panel p-6">
-            <div className="flex justify-between items-center mb-6">
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded bg-purple-500/20 text-purple-400">
-                  <Plus className="w-5 h-5" />
-                </div>
-                <h3 className="text-xl font-semibold">Active Camera Feeds</h3>
-              </div>
-              <button 
-                onClick={fetchCameras}
-                className="p-2 hover:bg-glass border border-glass-border rounded-lg text-foreground/60 hover:text-foreground transition-colors cursor-pointer"
-                title="Yenile"
-              >
-                <RefreshCw className="w-4 h-4" />
-              </button>
+          {loading ? (
+            <div
+              className="py-10 flex justify-center"
+              role="status"
+              aria-label="Loading cameras"
+            >
+              <Loader2 className="w-7 h-7 animate-spin text-brand" />
             </div>
-
-            {cameras.length === 0 ? (
-              <div className="text-center p-12 text-foreground/40 border border-glass-border border-dashed rounded-lg bg-black/10">
-                No active camera streams configured. Use the form to link a local webcam (0) or network RTSP stream.
-              </div>
-            ) : (
-              <div className="space-y-4">
-                {cameras.map(cam => (
-                  <div 
-                    key={cam.id}
-                    className="glass-panel p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border border-glass-border bg-black/20"
-                  >
-                    <div className="flex items-center gap-3">
-                      <div 
-                        className={`w-10 h-10 rounded-full flex items-center justify-center border ${
-                          cam.status === "active" 
-                            ? "bg-green-500/10 border-green-500/30 text-green-400" 
-                            : "bg-danger/10 border-danger/30 text-danger"
-                        }`}
-                      >
-                        <Camera className="w-5 h-5" />
-                      </div>
-                      <div>
-                        <h4 className="font-semibold text-foreground flex items-center gap-2">
-                          {cam.name}
-                          <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-full border ${
-                            cam.status === "active"
-                              ? "bg-green-500/10 border-green-500/20 text-green-400"
-                              : "bg-danger/10 border-danger/20 text-danger"
-                          }`}>
-                            {cam.status === "active" ? "Active" : "Offline / Error"}
-                          </span>
-                        </h4>
-                        <p className="text-xs text-foreground/50 mt-1 font-mono">Source: {cam.source}</p>
-                        <p className="text-xs text-brand font-medium mt-1">
-                          {cam.roi_points && cam.roi_points.length > 0 
-                            ? `✓ Region of Interest (ROI) configured: ${cam.roi_points.length} points`
-                            : "⚠️ No ROI configured. Entire screen monitored."}
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 self-end md:self-auto">
-                      <button
-                        onClick={() => openRoiModal(cam)}
-                        className="flex items-center gap-1.5 px-3 py-1.5 bg-brand/20 border border-brand/35 text-brand hover:bg-brand/30 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
-                      >
-                        <Edit className="w-3.5 h-3.5" />
-                        Configure ROI
-                      </button>
-                      <button
-                        onClick={() => handleDeleteCamera(cam.id)}
-                        className="p-2 text-foreground/50 hover:text-danger hover:bg-danger/10 rounded-lg transition-colors cursor-pointer"
-                        title="Delete camera feed"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
+          ) : cameras.length === 0 ? (
+            <p className="p-8 text-center text-foreground/50 border border-dashed border-glass-border rounded-lg">
+              No cameras configured.
+              {canAdmin && " Add a camera to start monitoring."}
+            </p>
+          ) : (
+            <div className="space-y-4">
+              {cameras.map((camera) => (
+                <article
+                  className="rounded-lg border border-glass-border p-4 bg-black/20"
+                  key={camera.id}
+                >
+                  <div className="flex flex-wrap justify-between gap-2">
+                    <h4 className="font-semibold break-all">{camera.name}</h4>
+                    <span
+                      className={`text-xs rounded-full px-2.5 py-1 capitalize ${camera.status === "active" ? "text-green-400 bg-green-500/10" : camera.status === "error" ? "text-danger bg-danger/10" : "text-amber-300 bg-amber-400/10"}`}
+                    >
+                      {camera.status}
+                    </span>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
+                  <p className="text-xs text-foreground/50 font-mono break-all mt-2">
+                    {camera.source}
+                  </p>
+                  <dl className="grid sm:grid-cols-3 gap-3 my-4 text-xs">
+                    <div>
+                      <dt className="text-foreground/50">Last frame</dt>
+                      <dd className="mt-1">
+                        {camera.last_frame_at
+                          ? new Date(camera.last_frame_at).toLocaleString()
+                          : "No frame received"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-foreground/50">Capture rate</dt>
+                      <dd className="mt-1">
+                        {Number(camera.fps || 0).toFixed(1)} FPS
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-foreground/50">Reconnect attempts</dt>
+                      <dd className="mt-1">{camera.reconnect_attempts || 0}</dd>
+                    </div>
+                  </dl>
+                  {camera.error && (
+                    <p className="text-xs text-danger mb-3 break-words">
+                      {camera.error}
+                    </p>
+                  )}
+                  <p className="text-xs text-foreground/60 mb-3">
+                    {camera.roi_points?.length
+                      ? "Legacy ROI configured"
+                      : "No legacy ROI"}{" "}
+                    · {camera.zones?.length || 0} zones ·{" "}
+                    {camera.privacy_masks?.length || 0} privacy masks
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      className={buttonClass}
+                      onClick={() => setSelectedCam(camera)}
+                    >
+                      <Edit className="w-4 h-4" />
+                      {canAdmin ? "Configure" : "View Rules"}
+                    </button>
+                    {canAdmin && (
+                      <>
+                        <button
+                          className={buttonClass}
+                          disabled={busy !== null}
+                          onClick={() => void cameraAction(camera, "reconnect")}
+                        >
+                          <RefreshCw
+                            className={`w-4 h-4 ${busy === camera.id ? "animate-spin" : ""}`}
+                          />
+                          Reconnect
+                        </button>
+                        <button
+                          className={`${buttonClass} text-danger ml-auto`}
+                          disabled={busy !== null}
+                          onClick={() => void cameraAction(camera, "delete")}
+                          aria-label={`Delete ${camera.name}`}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
       </div>
-
-      {/* ROI Drawing Canvas Modal */}
       {selectedCam && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md transition-all duration-300">
-          <div className="glass-panel w-full max-w-4xl overflow-hidden border border-glass-border shadow-2xl relative animate-in fade-in zoom-in-95 duration-200">
-            {/* Modal Header */}
-            <div className="glass-header px-6 py-4 flex justify-between items-center">
-              <div>
-                <h3 className="text-lg font-bold text-foreground">Interactive ROI Canvas Drawer</h3>
-                <p className="text-xs text-foreground/60">{selectedCam.name} ({selectedCam.source})</p>
-              </div>
-              <button 
-                onClick={() => setSelectedCam(null)}
-                className="p-1.5 hover:bg-white/10 rounded-lg text-foreground/70 hover:text-foreground transition-colors cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+        <CameraEditor
+          key={selectedCam.id}
+          camera={selectedCam}
+          canAdmin={canAdmin}
+          onClose={() => setSelectedCam(null)}
+          onSaved={() => {
+            setSelectedCam(null);
+            setNotice({
+              type: "success",
+              text: "Camera rules, zones and privacy masks saved.",
+            });
+            void fetchCameras();
+          }}
+        />
+      )}
+    </div>
+  );
+}
 
-            {/* Modal Content */}
-            <div className="p-6 space-y-4">
-              <div className="p-3 bg-brand/10 border border-brand/20 text-brand rounded-lg text-xs flex items-start gap-2 leading-relaxed">
-                <HelpCircle className="w-4 h-4 mt-0.5 shrink-0" />
-                <span>
-                  <strong>Nasıl ROI Çizilir:</strong> Canlı görüntü üzerine fareyle tıklayarak polygon noktalarını yerleştirin. Noktaları sırasıyla birleştiren çizgiler oluşacaktır. En az 3 nokta yerleştirerek loitering (bekleme) ve yasaklı alan bölgesi tanımlayabilirsiniz. Tamamlandığında <strong>Save ROI coordinates</strong> butonuna tıklayın.
+function CameraEditor({
+  camera,
+  canAdmin,
+  onClose,
+  onSaved,
+}: {
+  camera: CameraData;
+  canAdmin: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [name, setName] = useState(camera.name);
+  const [rules, setRules] = useState<DetectionRules>({
+    ...DEFAULT_RULES,
+    ...camera.detection,
+  });
+  const [roi, setRoi] = useState<Polygon>(camera.roi_points || []);
+  const [zones, setZones] = useState<Zone[]>(camera.zones || []);
+  const [masks, setMasks] = useState<Polygon[]>(camera.privacy_masks || []);
+  const [target, setTarget] = useState<DrawingTarget>({ kind: "roi" });
+  const [frame, setFrame] = useState<string | null>(null);
+  const [streamState, setStreamState] = useState("Connecting to preview…");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const points =
+    target.kind === "roi"
+      ? roi
+      : target.kind === "zone"
+        ? zones[target.index]?.points || []
+        : masks[target.index] || [];
+
+  useEffect(() => {
+    let stopped = false;
+    let socket: WebSocket | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let retries = 0;
+    const connect = () => {
+      if (stopped) return;
+      const connection = new WebSocket(wsUrl("/ws"));
+      socket = connection;
+      connection.onopen = () => {
+        if (stopped || socket !== connection) return;
+        retries = 0;
+        setStreamState("Waiting for this camera’s next frame…");
+      };
+      connection.onmessage = (event) => {
+        if (stopped || socket !== connection) return;
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type !== "multi_frame" || !Array.isArray(payload.cameras))
+            return;
+          const match = payload.cameras.find(
+            (item: CameraFeed) => item.camera_id === camera.id,
+          );
+          if (match?.data) {
+            setFrame(match.data);
+            setStreamState("Live preview");
+          }
+        } catch {
+          setStreamState("Preview unavailable. Waiting for a valid frame…");
+        }
+      };
+      connection.onclose = (event) => {
+        if (stopped || socket !== connection) return;
+        if ([1008, 4401, 4403].includes(event.code)) {
+          stopped = true;
+          setStreamState("Camera preview authorization expired. Sign in again.");
+          window.dispatchEvent(new Event("theftguard:unauthorized"));
+          return;
+        }
+        setStreamState("Preview disconnected. Reconnecting…");
+        retry = setTimeout(
+          connect,
+          Math.min(15000, 1000 * 2 ** Math.min(retries++, 4)),
+        );
+      };
+      connection.onerror = () => {
+        if (!stopped) connection.close();
+      };
+    };
+    connect();
+    return () => {
+      stopped = true;
+      clearTimeout(retry);
+      if (socket) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        socket.close();
+      }
+    };
+  }, [camera.id]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    let cancelled = false;
+    function polygon(
+      shape: Polygon,
+      color: string,
+      label: string,
+      selected: boolean,
+      mask = false,
+    ) {
+      if (!context || shape.length === 0) return;
+      context.beginPath();
+      context.moveTo(shape[0][0], shape[0][1]);
+      shape.slice(1).forEach(([x, y]) => context.lineTo(x, y));
+      context.closePath();
+      context.fillStyle = mask ? "rgba(0,0,0,0.85)" : `${color}33`;
+      context.fill();
+      context.strokeStyle = color;
+      context.lineWidth = selected ? 5 : 2;
+      context.stroke();
+      context.font = "bold 18px sans-serif";
+      context.fillStyle = color;
+      context.textAlign = "left";
+      context.fillText(label, shape[0][0] + 10, Math.max(22, shape[0][1] - 10));
+      if (selected)
+        shape.forEach(([x, y], index) => {
+          context.beginPath();
+          context.arc(x, y, 6, 0, Math.PI * 2);
+          context.fillStyle = "white";
+          context.fill();
+          context.fillText(String(index + 1), x + 10, y + 20);
+        });
+    }
+    const overlay = () => {
+      polygon(roi, "#60a5fa", "Legacy ROI", target.kind === "roi");
+      zones.forEach((zone, index) =>
+        polygon(
+          zone.points,
+          zone.kind === "restricted" ? "#f87171" : "#fbbf24",
+          zone.name,
+          target.kind === "zone" && target.index === index,
+        ),
+      );
+      masks.forEach((mask, index) =>
+        polygon(
+          mask,
+          "#c084fc",
+          `Privacy ${index + 1}`,
+          target.kind === "mask" && target.index === index,
+          true,
+        ),
+      );
+    };
+    context.fillStyle = "#151824";
+    context.fillRect(0, 0, 1280, 720);
+    if (frame) {
+      const picture = new Image();
+      picture.onload = () => {
+        if (!cancelled) {
+          context.drawImage(picture, 0, 0, 1280, 720);
+          overlay();
+        }
+      };
+      picture.src = `data:image/jpeg;base64,${frame}`;
+    } else {
+      context.fillStyle = "#94a3b8";
+      context.font = "22px sans-serif";
+      context.textAlign = "center";
+      context.fillText("No camera preview available", 640, 340);
+      context.font = "16px sans-serif";
+      context.fillText("You can still configure rules and regions.", 640, 375);
+      overlay();
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [frame, roi, zones, masks, target]);
+
+  function updatePoints(next: Polygon) {
+    if (!canAdmin || saving) return;
+    setDirty(true);
+    if (target.kind === "roi") setRoi(next);
+    else if (target.kind === "zone")
+      setZones((previous) =>
+        previous.map((zone, index) =>
+          index === target.index ? { ...zone, points: next } : zone,
+        ),
+      );
+    else
+      setMasks((previous) =>
+        previous.map((mask, index) => (index === target.index ? next : mask)),
+      );
+  }
+  function changeRule<K extends keyof DetectionRules>(
+    key: K,
+    value: DetectionRules[K],
+  ) {
+    setRules((previous) => ({ ...previous, [key]: value }));
+    setDirty(true);
+  }
+  function changeZone(update: Partial<Zone>) {
+    if (target.kind !== "zone") return;
+    setZones((previous) =>
+      previous.map((zone, index) =>
+        index === target.index ? { ...zone, ...update } : zone,
+      ),
+    );
+    setDirty(true);
+  }
+  function addShape(kind: "zone" | "mask") {
+    if (kind === "zone") {
+      setTarget({ kind: "zone", index: zones.length });
+      setZones((previous) => [
+        ...previous,
+        {
+          id: crypto.randomUUID(),
+          name: `Zone ${previous.length + 1}`,
+          kind: "restricted",
+          points: [],
+          loitering_seconds: 5,
+        },
+      ]);
+    } else {
+      setTarget({ kind: "mask", index: masks.length });
+      setMasks((previous) => [...previous, []]);
+    }
+    setDirty(true);
+  }
+  function close() {
+    if (!saving && (!dirty || confirm("Discard unsaved camera changes?")))
+      onClose();
+  }
+  async function save(event: React.FormEvent) {
+    event.preventDefault();
+    if (!canAdmin) return;
+    if (
+      (roi.length > 0 && roi.length < 3) ||
+      zones.some((zone) => zone.points.length < 3) ||
+      masks.some((mask) => mask.length < 3)
+    ) {
+      setError(
+        "Each region needs at least 3 points. Clear the legacy ROI to disable it, or remove incomplete zones and masks.",
+      );
+      return;
+    }
+    if (!name.trim() || zones.some((zone) => !zone.name.trim())) {
+      setError("Camera and zone names cannot be empty.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const response = await apiFetch(
+        `/cameras/${encodeURIComponent(camera.id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: name.trim(),
+            detection: rules,
+            roi_points: roi,
+            zones: zones.map((zone) => ({ ...zone, name: zone.name.trim() })),
+            privacy_masks: masks,
+          }),
+        },
+      );
+      if (!response.ok)
+        throw new Error(
+          await responseError(response, "Could not save camera changes."),
+        );
+      onSaved();
+    } catch (saveError) {
+      setError(errorText(saveError));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/80 backdrop-blur-md"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="camera-editor-title"
+    >
+      <form
+        onSubmit={save}
+        className="glass-panel w-full max-w-6xl max-h-[94vh] overflow-y-auto shadow-2xl"
+      >
+        <div className="glass-header p-5 flex items-center justify-between gap-3">
+          <div>
+            <h3 id="camera-editor-title" className="text-xl font-bold">
+              {camera.name}: Rules & Regions
+            </h3>
+            <p className="text-xs text-foreground/60 mt-1">
+              {streamState} · Coordinates use the 1280 × 720 camera frame.
+            </p>
+          </div>
+          <button
+            type="button"
+            className={buttonClass}
+            disabled={saving}
+            onClick={close}
+            aria-label="Close camera editor"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+        <fieldset
+          disabled={!canAdmin || saving}
+          className="p-5 space-y-5 min-w-0"
+        >
+          <label className="block text-sm space-y-2">
+            <span>Camera name</span>
+            <input
+              className={inputClass}
+              value={name}
+              maxLength={100}
+              required
+              onChange={(event) => {
+                setName(event.target.value);
+                setDirty(true);
+              }}
+            />
+          </label>
+          <section className="grid lg:grid-cols-[1fr_270px] gap-5">
+            <div className="space-y-3">
+              <p className="text-sm text-foreground/70">
+                Select a region, then click the preview to place its corners.
+                Regions need at least 3 points. Privacy masks obscure video,
+                event images and clips.
+              </p>
+              <canvas
+                ref={canvasRef}
+                width={1280}
+                height={720}
+                aria-label="Camera region drawing canvas"
+                className={`w-full aspect-video rounded-lg border border-glass-border ${canAdmin ? "cursor-crosshair" : ""}`}
+                onClick={(event) => {
+                  if (!canAdmin || saving) return;
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  updatePoints([
+                    ...points,
+                    [
+                      Math.max(
+                        0,
+                        Math.min(
+                          1280,
+                          Math.round(
+                            ((event.clientX - bounds.left) * 1280) /
+                              bounds.width,
+                          ),
+                        ),
+                      ),
+                      Math.max(
+                        0,
+                        Math.min(
+                          720,
+                          Math.round(
+                            ((event.clientY - bounds.top) * 720) /
+                              bounds.height,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ]);
+                }}
+              />
+              <div className="flex items-center flex-wrap gap-2">
+                <span className="text-xs text-foreground/60 mr-auto">
+                  {target.kind === "roi"
+                    ? "Legacy ROI"
+                    : target.kind === "zone"
+                      ? zones[target.index]?.name
+                      : `Privacy mask ${target.index + 1}`}{" "}
+                  · {points.length} points
                 </span>
+                <button
+                  type="button"
+                  className={buttonClass}
+                  disabled={!points.length || saving || !canAdmin}
+                  onClick={() => updatePoints(points.slice(0, -1))}
+                >
+                  Undo Point
+                </button>
+                <button
+                  type="button"
+                  className={buttonClass}
+                  onClick={() => updatePoints([])}
+                >
+                  Clear Points
+                </button>
               </div>
-
-              {/* Responsive 1280x720 Canvas */}
-              <div className="aspect-video w-full bg-black/60 rounded-lg overflow-hidden border border-glass-border relative flex items-center justify-center">
-                <canvas
-                  ref={canvasRef}
-                  width={1280}
-                  height={720}
-                  onClick={handleCanvasClick}
-                  className="w-full h-auto aspect-video cursor-crosshair object-contain"
-                />
-              </div>
-
-              <div className="flex justify-between items-center text-xs text-foreground/50 px-1">
-                <span>Coordinates: [{roiPoints.map(p => `(${p[0]},${p[1]})`).join(", ")}]</span>
-                <span>Points count: {roiPoints.length}</span>
-              </div>
+              {target.kind === "zone" && zones[target.index] && (
+                <div className="grid sm:grid-cols-3 gap-3 rounded-lg border border-glass-border p-3">
+                  <label className="text-sm space-y-2">
+                    <span>Zone name</span>
+                    <input
+                      className={inputClass}
+                      value={zones[target.index].name}
+                      maxLength={80}
+                      required
+                      onChange={(event) =>
+                        changeZone({ name: event.target.value })
+                      }
+                    />
+                  </label>
+                  <label className="text-sm space-y-2">
+                    <span>Zone rule</span>
+                    <select
+                      className={inputClass}
+                      value={zones[target.index].kind}
+                      onChange={(event) =>
+                        changeZone({ kind: event.target.value as Zone["kind"] })
+                      }
+                    >
+                      <option value="restricted">Restricted area</option>
+                      <option value="loitering">Loitering</option>
+                    </select>
+                  </label>
+                  {zones[target.index].kind === "loitering" && (
+                    <label className="text-sm space-y-2">
+                      <span>Dwell time (seconds)</span>
+                      <input
+                        type="number"
+                        className={inputClass}
+                        min={1}
+                        max={3600}
+                        step={1}
+                        required
+                        value={zones[target.index].loitering_seconds}
+                        onChange={(event) =>
+                          changeZone({
+                            loitering_seconds: Number(event.target.value),
+                          })
+                        }
+                      />
+                    </label>
+                  )}
+                </div>
+              )}
             </div>
-
-            {/* Modal Footer */}
-            <div className="glass-header border-t border-b-0 px-6 py-4 flex justify-between items-center gap-4">
-              <button 
-                onClick={clearRoiPoints}
-                className="px-4 py-2 border border-glass-border hover:bg-glass rounded-lg text-sm font-semibold transition-colors cursor-pointer text-foreground/80 hover:text-foreground"
+            <div className="space-y-3">
+              <h4 className="font-semibold">Regions</h4>
+              <button
+                type="button"
+                className={`${buttonClass} w-full justify-start ${target.kind === "roi" ? "bg-brand/20 border-brand" : ""}`}
+                onClick={() => setTarget({ kind: "roi" })}
               >
-                Clear Points
+                Legacy ROI{" "}
+                <span className="ml-auto text-xs">{roi.length} pts</span>
               </button>
-              
-              <div className="flex items-center gap-2">
-                <button 
-                  onClick={() => setSelectedCam(null)}
-                  className="px-4 py-2 border border-glass-border hover:bg-glass rounded-lg text-sm font-semibold transition-colors cursor-pointer text-foreground/80 hover:text-foreground"
+              {zones.map((zone, index) => (
+                <div className="flex gap-1" key={zone.id}>
+                  <button
+                    type="button"
+                    className={`${buttonClass} flex-1 min-w-0 justify-start ${target.kind === "zone" && target.index === index ? "bg-brand/20 border-brand" : ""}`}
+                    onClick={() => setTarget({ kind: "zone", index })}
+                  >
+                    <span className="truncate">
+                      {zone.name || "Unnamed zone"}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`${buttonClass} text-danger`}
+                    aria-label={`Delete ${zone.name}`}
+                    onClick={() => {
+                      setZones((previous) =>
+                        previous.filter((_, item) => item !== index),
+                      );
+                      setTarget({ kind: "roi" });
+                      setDirty(true);
+                    }}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                className={`${buttonClass} w-full`}
+                onClick={() => addShape("zone")}
+              >
+                <Plus className="w-4 h-4" />
+                Add Named Zone
+              </button>
+              <h4 className="font-semibold pt-2 flex gap-2 items-center">
+                <Shield className="w-4 h-4" />
+                Privacy Masks
+              </h4>
+              {masks.map((mask, index) => (
+                <div className="flex gap-1" key={index}>
+                  <button
+                    type="button"
+                    className={`${buttonClass} flex-1 justify-start ${target.kind === "mask" && target.index === index ? "bg-brand/20 border-brand" : ""}`}
+                    onClick={() => setTarget({ kind: "mask", index })}
+                  >
+                    Mask {index + 1}{" "}
+                    <span className="ml-auto text-xs">{mask.length} pts</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`${buttonClass} text-danger`}
+                    aria-label={`Delete privacy mask ${index + 1}`}
+                    onClick={() => {
+                      setMasks((previous) =>
+                        previous.filter((_, item) => item !== index),
+                      );
+                      setTarget({ kind: "roi" });
+                      setDirty(true);
+                    }}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                className={`${buttonClass} w-full`}
+                onClick={() => addShape("mask")}
+              >
+                <Plus className="w-4 h-4" />
+                Add Privacy Mask
+              </button>
+              <p className="text-xs text-foreground/50">
+                Blue: legacy ROI · Red: restricted · Amber: loitering · Purple:
+                privacy. Changes apply after saving.
+              </p>
+            </div>
+          </section>
+          <section className="border-t border-glass-border pt-5 space-y-4">
+            <h4 className="font-semibold">Detection Sensitivity</h4>
+            <p className="text-sm text-foreground/60">
+              Adjust persistence and cooldown to reduce repeated or short-lived
+              alerts. Each enabled rule remains a review signal.
+            </p>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <label className="text-sm space-y-2">
+                <span>Confidence threshold</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={0.05}
+                  max={0.95}
+                  step={0.01}
+                  required
+                  value={rules.confidence}
+                  onChange={(event) =>
+                    changeRule("confidence", Number(event.target.value))
+                  }
+                />
+              </label>
+              <label className="text-sm space-y-2">
+                <span>Default dwell time (s)</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={1}
+                  max={3600}
+                  required
+                  value={rules.loitering_seconds}
+                  onChange={(event) =>
+                    changeRule("loitering_seconds", Number(event.target.value))
+                  }
+                />
+              </label>
+              <label className="text-sm space-y-2">
+                <span>Alert cooldown (s)</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={0}
+                  max={3600}
+                  required
+                  value={rules.cooldown_seconds}
+                  onChange={(event) =>
+                    changeRule("cooldown_seconds", Number(event.target.value))
+                  }
+                />
+              </label>
+              <label className="text-sm space-y-2">
+                <span>Persistence (frames)</span>
+                <input
+                  className={inputClass}
+                  type="number"
+                  min={1}
+                  max={120}
+                  step={1}
+                  required
+                  value={rules.inertia_frames}
+                  onChange={(event) =>
+                    changeRule("inertia_frames", Number(event.target.value))
+                  }
+                />
+              </label>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
+              {(
+                [
+                  ["intrusion_enabled", "Restricted-area alerts"],
+                  ["loitering_enabled", "Loitering alerts"],
+                  ["concealment_enabled", "Concealment alerts"],
+                  ["bending_enabled", "Bending alerts"],
+                ] as const
+              ).map(([key, label]) => (
+                <label key={key} className="flex gap-2 items-center text-sm">
+                  <input
+                    type="checkbox"
+                    checked={rules[key]}
+                    onChange={(event) => changeRule(key, event.target.checked)}
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+          </section>
+        </fieldset>
+        <div className="p-5 border-t border-glass-border space-y-3">
+          {error && <NoticeBanner notice={{ type: "error", text: error }} />}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-sm text-foreground/60" aria-live="polite">
+              {!canAdmin
+                ? "Read-only access. An administrator can change camera rules."
+                : saving
+                  ? "Saving changes…"
+                  : dirty
+                    ? "You have unsaved changes."
+                    : "Camera configuration is up to date."}
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                className={buttonClass}
+                onClick={close}
+                disabled={saving}
+              >
+                {canAdmin ? "Cancel" : "Close"}
+              </button>
+              {canAdmin && (
+                <button
+                  type="submit"
+                  className={`${buttonClass} bg-brand text-white`}
+                  disabled={saving || !dirty}
                 >
-                  Cancel
+                  {saving ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Save className="w-4 h-4" />
+                  )}
+                  Save Changes
                 </button>
-                <button 
-                  onClick={handleSaveRoi}
-                  className="px-6 py-2 bg-brand hover:bg-brand/90 text-white rounded-lg text-sm font-bold transition-colors cursor-pointer"
-                >
-                  Save ROI Coordinates
-                </button>
-              </div>
+              )}
             </div>
           </div>
         </div>
-      )}
+      </form>
     </div>
   );
 }

@@ -1,107 +1,628 @@
-import cv2
+"""Authenticated surveillance API and camera inference service."""
 import asyncio
 import base64
-import os
-from dotenv import load_dotenv
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-
-load_dotenv()
-from ultralytics import YOLO
-import numpy as np
-import time
-from datetime import datetime
-import json
-import threading
-import uuid
-import smtplib
+from datetime import datetime, timezone
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.image import MIMEImage
-import requests
-from pydantic import BaseModel
-import sqlite3
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
 import pickle
+import secrets
+import smtplib
+import ssl
+import sqlite3
+import threading
+import time
+from typing import Literal
+import uuid
+
+import cv2
+from dotenv import load_dotenv, set_key
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
+import numpy as np
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+import requests
+
+from auth_store import AuthStore
+from camera_runtime import MAX_CAMERAS, CameraManager, validate_polygon
+from detection_rules import RuleTracker, apply_privacy_masks, scale_polygon
+from event_store import EventStore
+from evidence_recorder import EvidenceRecorder
+
 try:
     import face_recognition
-    FACE_REC_AVAILABLE = True
 except ImportError:
-    FACE_REC_AVAILABLE = False
-    print("face_recognition not installed. Face ID disabled.")
-
+    face_recognition = None
 try:
     import psutil
-    PSUTIL_AVAILABLE = True
 except ImportError:
-    PSUTIL_AVAILABLE = False
-    print("psutil not installed. System resource monitor will run in simulation mode.")
+    psutil = None
+FACE_REC_AVAILABLE = face_recognition is not None
+PSUTIL_AVAILABLE = psutil is not None
 
-if not os.path.exists("alerts"):
-    os.makedirs("alerts")
+DATA_DIR = Path(os.environ.get("THEFTGUARD_DATA_DIR", ".")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+load_dotenv(DATA_DIR / ".env")
+DB_NAME = str(DATA_DIR / "theft_detection.db")
+SETTINGS_FILE = DATA_DIR / "settings.json"
+EVIDENCE_DIR = DATA_DIR / "alerts"
+EVIDENCE_DIR.mkdir(exist_ok=True)
+MODEL_DIR = Path(os.environ.get("THEFTGUARD_MODEL_DIR", Path(__file__).parent)).resolve()
+SESSION_COOKIE = "theftguard_session"
+ALLOWED_ORIGINS = [s.strip().rstrip("/") for s in os.environ.get(
+    "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+).split(",") if s.strip()]
+COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
+auth_store = AuthStore(os.environ.get("AUTH_DB_PATH", str(DATA_DIR / "data" / "auth.sqlite3")))
+event_store = EventStore(DB_NAME, evidence_dir=str(EVIDENCE_DIR))
+# One backend process owns capture and recording for this data directory.
+# Jobs left pending by a previous process have no live recorder to finish them.
+event_store.reconcile_pending_clips()
+with sqlite3.connect(DB_NAME) as conn:
+    conn.execute("CREATE TABLE IF NOT EXISTS faces (id TEXT PRIMARY KEY, name TEXT, type TEXT, encoding BLOB)")
 
-app = FastAPI()
-
-app.mount("/alerts", StaticFiles(directory="alerts"), name="alerts")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Database Setup ---
-DB_NAME = "theft_detection.db"
-
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS alerts
-                     (id TEXT PRIMARY KEY, message TEXT, timestamp TEXT, image_path TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS faces
-                     (id TEXT PRIMARY KEY, name TEXT, type TEXT, encoding BLOB)''')
-        conn.commit()
-        conn.close()
-        print("Database initialized.")
-    except Exception as e:
-        print(f"Database error: {e}")
-
-init_db()
-
-# --- Settings & Models ---
-SETTINGS_FILE = "settings.json"
 
 class SettingsModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     emailEnabled: bool = False
-    smtpServer: str = "smtp.gmail.com"
+    smtpServer: str = Field(default="smtp.gmail.com", max_length=253)
     smtpPort: str = "587"
-    senderEmail: str = ""
-    senderPassword: str = ""
-    receiverEmail: str = ""
+    senderEmail: str = Field(default="", max_length=254)
+    senderPassword: str = Field(default="", max_length=1024)
+    receiverEmail: str = Field(default="", max_length=254)
     telegramEnabled: bool = False
-    telegramBotToken: str = ""
-    telegramChatId: str = ""
-    roiPoints: list[list[int]] = []
+    telegramBotToken: str = Field(default="", max_length=1024)
+    telegramChatId: str = Field(default="", max_length=100)
+    roiPoints: list[list[float]] = Field(default_factory=list)
     showHeatmap: bool = False
+    includeImagesInNotifications: bool = True
+    clipEnabled: bool = True
+    clipPreSeconds: int = Field(default=5, ge=0, le=15)
+    clipPostSeconds: int = Field(default=5, ge=1, le=30)
+    retentionDays: int = Field(default=0, ge=0, le=3650)
+
+    @field_validator("roiPoints", mode="before")
+    @classmethod
+    def valid_roi(cls, value):
+        return validate_polygon(value)
 
 
-try:
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, "r") as f:
-            settings_data = json.load(f)
-            current_settings = SettingsModel(**settings_data)
-            roi_points = current_settings.roiPoints
-    else:
-        current_settings = SettingsModel()
-except Exception as e:
-    current_settings = SettingsModel()
+current_settings = SettingsModel()
+if SETTINGS_FILE.exists():
+    current_settings = SettingsModel(**json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+# Legacy secret values are used only inside this process, never returned to clients.
+for field, env_name in [("senderPassword", "SMTP_PASSWORD"), ("telegramBotToken", "TELEGRAM_BOT_TOKEN")]:
+    value = getattr(current_settings, field)
+    if value and value != "********":
+        os.environ.setdefault(env_name, value)
+    setattr(current_settings, field, "")
+roi_points = current_settings.roiPoints.copy()
+settings_lock = threading.RLock()
+privacy_lock = threading.RLock()
+lock = threading.Lock()
+latest_frame = None
+alert_payload = None
+recent_alerts = deque(maxlen=128)
+stop_event = threading.Event()
+notification_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="notifications")
+notification_slots = threading.BoundedSemaphore(8)
+retention_signing_key = secrets.token_bytes(32)
+retention_tokens_used = {}
+retention_lock = threading.Lock()
+login_attempts = {}
+login_lock = threading.Lock()
+rule_tracker = RuleTracker()
+camera_manager = CameraManager(path=str(DATA_DIR / "cameras.json"))
 
 
-# --- Heatmap Logic ---
+def clip_complete(event_id, clip_path, status):
+    event_store.set_clip(event_id, public_evidence_path(clip_path) if clip_path else "", status)
+
+
+def public_evidence_path(path):
+    return f"alerts/{Path(path).name}" if path else ""
+
+
+recorder = EvidenceRecorder(
+    evidence_dir=str(EVIDENCE_DIR), on_complete=clip_complete,
+    pre_seconds=current_settings.clipPreSeconds,
+    post_seconds=current_settings.clipPostSeconds,
+    max_cameras=MAX_CAMERAS,
+)
+recorder.configure(enabled=current_settings.clipEnabled)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    stop_event.clear()
+    workers = []
+    if os.environ.get("THEFTGUARD_DISABLE_VIDEO") != "1":
+        worker = threading.Thread(target=video_loop, daemon=True, name="video-inference")
+        worker.start()
+        workers.append(worker)
+    yield
+    stop_event.set()
+    camera_manager.close()
+    for worker in workers:
+        worker.join(timeout=8)
+    recorder.shutdown(wait=True)
+    notification_pool.shutdown(wait=False, cancel_futures=True)
+
+
+app = FastAPI(title="TheftGuard API", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    # Pydantic's default response may echo passwords or notification credentials.
+    details = [{"loc": list(error["loc"]), "type": error["type"], "msg": error["msg"]}
+               for error in exc.errors()]
+    return JSONResponse({"detail": details}, status_code=422)
+
+
+@app.middleware("http")
+async def access_control(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if request.headers.get("x-requested-with") != "XMLHttpRequest" or (origin and origin.rstrip("/") not in ALLOWED_ORIGINS):
+            return JSONResponse({"detail": "Request origin or CSRF header rejected"}, status_code=403)
+    if path not in {"/auth/status", "/auth/login", "/auth/logout", "/health"}:
+        user = auth_store.get_session(request.cookies.get(SESSION_COOKIE, ""))
+        if user is None:
+            return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        request.state.user = user
+        admin_read = path == "/settings" or path.startswith("/storage") or path.startswith("/users")
+        if admin_read and user["role"] != "admin":
+            return JSONResponse({"detail": "Administrator access required"}, status_code=403)
+        if request.method not in {"GET", "HEAD"} and path != "/auth/logout":
+            allowed = {"admin", "operator"} if path.startswith("/events/") and request.method == "PATCH" else {"admin"}
+            if user["role"] not in allowed:
+                return JSONResponse({"detail": "Insufficient permissions"}, status_code=403)
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True,
+                   allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+                   allow_headers=["Content-Type", "X-Requested-With"])
+
+
+class LoginInput(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class UserInput(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=12, max_length=1024)
+    role: Literal["admin", "operator", "viewer"] = "viewer"
+
+
+class UserUpdate(BaseModel):
+    password: str | None = Field(default=None, min_length=12, max_length=1024)
+    role: Literal["admin", "operator", "viewer"] | None = None
+    active: bool | None = None
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/auth/status")
+def authentication_status():
+    return {"initialized": auth_store.initialized()}
+
+
+@app.post("/auth/login")
+def login(data: LoginInput, request: Request, response: Response):
+    # Per-account throttling also works behind a reverse proxy without trusting forwarded IPs.
+    key = data.username.strip().lower()
+    now = time.monotonic()
+    with login_lock:
+        for name in list(login_attempts):
+            login_attempts[name] = [t for t in login_attempts[name] if now - t < 300]
+            if not login_attempts[name]:
+                del login_attempts[name]
+        attempts = login_attempts.setdefault(key, [])
+        if len(attempts) >= 10 or len(login_attempts) > 1000:
+            raise HTTPException(429, "Too many sign-in attempts. Try again later.")
+        attempts.append(now)
+    token = auth_store.authenticate(data.username, data.password)
+    if token is None:
+        raise HTTPException(401, "Incorrect username or password")
+    with login_lock:
+        login_attempts.pop(key, None)
+    auth_store.revoke_session(request.cookies.get(SESSION_COOKIE, ""))
+    response.set_cookie(SESSION_COOKIE, token, max_age=28800, httponly=True,
+                        secure=COOKIE_SECURE, samesite="lax", path="/")
+    return {"user": auth_store.get_session(token)}
+
+
+@app.post("/auth/logout")
+def logout(request: Request, response: Response):
+    auth_store.revoke_session(request.cookies.get(SESSION_COOKIE, ""))
+    response.delete_cookie(SESSION_COOKIE, path="/", httponly=True, secure=COOKIE_SECURE, samesite="lax")
+    return {"status": "success"}
+
+
+@app.get("/auth/me")
+def me(request: Request):
+    return request.state.user
+
+
+@app.get("/users")
+def users():
+    return {"users": auth_store.list_users()}
+
+
+@app.post("/users", status_code=201)
+def create_user(data: UserInput):
+    try:
+        return auth_store.create_user(data.username, data.password, data.role)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.patch("/users/{user_id}")
+def update_user(user_id: int, data: UserUpdate):
+    try:
+        return auth_store.update_user(user_id, **data.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(404, "User not found") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/alerts/{filename}")
+def evidence(filename: str):
+    path = (EVIDENCE_DIR / filename).resolve()
+    if path.parent != EVIDENCE_DIR.resolve() or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".mp4"} or not path.is_file():
+        raise HTTPException(404, "Evidence not found")
+    return FileResponse(path)
+
+
+def event_filters(search=None, camera_id=None, event_type=None, status=None, archived=None, start_date=None, end_date=None):
+    return {k: v for k, v in locals().items() if v is not None and v != ""}
+
+
+@app.get("/events")
+def list_events(page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=100),
+                search: str | None = Query(None, max_length=200), camera_id: str | None = None,
+                event_type: str | None = None, status: str | None = None, archived: bool | None = None,
+                start_date: str | None = None, end_date: str | None = None):
+    try:
+        return event_store.list_events(page=page, page_size=page_size, **event_filters(search, camera_id, event_type, status, archived, start_date, end_date))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/events/export.csv")
+def export_events(search: str | None = Query(None, max_length=200), camera_id: str | None = None,
+                  event_type: str | None = None, status: str | None = None, archived: bool | None = None,
+                  start_date: str | None = None, end_date: str | None = None):
+    try:
+        content = event_store.export_csv(**event_filters(search, camera_id, event_type, status, archived, start_date, end_date))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return Response(content, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="TheftGuard-events.csv"'})
+
+
+class EventUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["new", "reviewed", "false_alarm"] | None = None
+    notes: str | None = Field(default=None, max_length=4000)
+    archived: bool | None = None
+
+
+@app.patch("/events/{event_id}")
+def review_event(event_id: str, data: EventUpdate, request: Request):
+    try:
+        result = event_store.update_event(event_id, **data.model_dump(exclude_none=True), reviewed_by=request.state.user["username"])
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if result is None:
+        raise HTTPException(404, "Event not found")
+    return result
+
+
+@app.get("/history")
+def get_history():
+    return event_store.list_events(page=1, page_size=100)["items"]
+
+
+@app.get("/stats")
+def get_stats():
+    result = event_store.stats()
+    result["cpu_load"] = psutil.cpu_percent() if psutil else None
+    result["ram_load"] = psutil.virtual_memory().percent if psutil else None
+    return result
+
+
+@app.get("/storage")
+def storage_status():
+    return {"storage": event_store.storage_metadata(), "recording": recorder.capabilities()}
+
+
+def sign_preview(data):
+    payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    signature = hmac.new(retention_signing_key, payload, hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(payload).decode() + "." + signature
+
+
+@app.get("/storage/retention/preview")
+def preview_retention(request: Request, days: int = Query(..., ge=1, le=3650)):
+    preview = event_store.retention_preview(days)
+    preview["token"] = sign_preview({"days": days, "cutoff": preview["cutoff"], "plan_digest": preview["plan_digest"], "user": request.state.user["id"], "expires": int(time.time()) + 600, "nonce": secrets.token_hex(16)})
+    return preview
+
+
+class RetentionInput(BaseModel):
+    days: int = Field(ge=1, le=3650)
+    cutoff: str
+    token: str = Field(max_length=4096)
+
+
+@app.post("/storage/retention/apply")
+def apply_retention(data: RetentionInput, request: Request):
+    try:
+        encoded, signature = data.token.rsplit(".", 1)
+        payload = base64.urlsafe_b64decode(encoded)
+        expected = hmac.new(retention_signing_key, payload, hashlib.sha256).hexdigest()
+        signed = json.loads(payload)
+        valid = hmac.compare_digest(signature, expected) and signed["days"] == data.days and signed["cutoff"] == data.cutoff and signed["user"] == request.state.user["id"] and signed["expires"] >= time.time()
+        if not valid:
+            raise ValueError("Invalid preview")
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(422, "Request a new cleanup preview before deleting evidence")
+    with retention_lock:
+        now = time.time()
+        for nonce in list(retention_tokens_used):
+            if retention_tokens_used[nonce] < now:
+                del retention_tokens_used[nonce]
+        if signed["nonce"] in retention_tokens_used:
+            raise HTTPException(422, "Request a new cleanup preview before deleting evidence")
+        try:
+            result = event_store.apply_retention(data.days, cutoff=data.cutoff, expected_digest=signed["plan_digest"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        retention_tokens_used[signed["nonce"]] = signed["expires"]
+        return result
+
+
+@app.get("/settings")
+def get_settings():
+    data = current_settings.model_dump()
+    data["senderPassword"] = "********" if os.environ.get("SMTP_PASSWORD") else ""
+    data["telegramBotToken"] = "********" if os.environ.get("TELEGRAM_BOT_TOKEN") else ""
+    return data
+
+
+def persist_settings(settings):
+    temporary = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+    temporary.write_text(json.dumps(settings.model_dump(), indent=4), encoding="utf-8")
+    os.replace(temporary, SETTINGS_FILE)
+
+
+@app.post("/settings")
+def save_settings(settings: SettingsModel):
+    global current_settings, roi_points
+    try:
+        port = int(settings.smtpPort)
+        if not 1 <= port <= 65535:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422, "SMTP port must be between 1 and 65535")
+    with settings_lock:
+        for field, env_name in [("senderPassword", "SMTP_PASSWORD"), ("telegramBotToken", "TELEGRAM_BOT_TOKEN")]:
+            value = getattr(settings, field)
+            if value and value != "********":
+                env_path = DATA_DIR / ".env"
+                env_path.touch(mode=0o600, exist_ok=True)
+                os.chmod(env_path, 0o600)
+                set_key(str(env_path), env_name, value)
+                os.environ[env_name] = value
+            setattr(settings, field, "")
+        persist_settings(settings)
+        current_settings = settings
+        roi_points = settings.roiPoints.copy()
+        recorder.configure(pre_seconds=settings.clipPreSeconds, post_seconds=settings.clipPostSeconds, enabled=settings.clipEnabled)
+    return {"status": "success", "message": "Settings saved"}
+
+
+class RoiInput(BaseModel):
+    points: list[list[float]]
+
+    @field_validator("points", mode="before")
+    @classmethod
+    def valid_points(cls, value):
+        return validate_polygon(value)
+
+
+@app.post("/roi")
+def save_roi(data: RoiInput):
+    global roi_points
+    points = data.points
+    with settings_lock:
+        current_settings.roiPoints = points
+        roi_points = points.copy()
+        persist_settings(current_settings)
+    return {"status": "success"}
+
+
+@app.get("/roi")
+def get_roi():
+    return {"points": roi_points}
+
+
+@app.post("/settings/test")
+def test_settings(settings: SettingsModel):
+    # Tests are only sent after an administrator explicitly presses the test button.
+    try:
+        send_notification("TheftGuard test notification", None, settings, strict=True)
+    except Exception:
+        return {"status": "error", "message": "Notification failed. Check the configured destination and credentials."}
+    return {"status": "success", "message": "Enabled test notifications sent"}
+
+
+class CameraInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    source: str = Field(min_length=1, max_length=2048)
+
+
+class CameraUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    roi_points: list[list[float]] | None = None
+    detection: dict | None = None
+    zones: list[dict] | None = None
+    privacy_masks: list[list[list[float]]] | None = None
+
+
+@app.post("/cameras", status_code=201)
+def add_camera(data: CameraInput):
+    try:
+        result = camera_manager.add_camera(data.source, data.name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"message": "Camera added; connection recovery is automatic", "camera": camera_manager.get_camera(result["id"])}
+
+
+@app.get("/cameras")
+def list_cameras():
+    return camera_manager.get_active_cameras()
+
+
+@app.patch("/cameras/{camera_id}")
+def update_camera(camera_id: str, data: CameraUpdate):
+    global latest_frame
+    try:
+        with privacy_lock:
+            result = camera_manager.update_camera(camera_id, **data.model_dump(exclude_none=True))
+            if result is not None and data.privacy_masks is not None:
+                recorder.clear_camera(camera_id)
+                with lock:
+                    latest_frame = None
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if result is None:
+        raise HTTPException(404, "Camera not found")
+    # Old rule observations must not be carried into changed regions or thresholds.
+    with lock:
+        rule_tracker.remove_camera(camera_id)
+    return result
+
+
+@app.post("/cameras/{camera_id}/reconnect")
+def reconnect_camera(camera_id: str):
+    if not camera_manager.reconnect_camera(camera_id):
+        raise HTTPException(404, "Camera not found")
+    return {"status": "reconnecting"}
+
+
+@app.delete("/cameras/{camera_id}")
+def delete_camera(camera_id: str):
+    try:
+        removed = camera_manager.remove_camera(camera_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not removed:
+        raise HTTPException(404, "Camera not found")
+    with lock:
+        rule_tracker.remove_camera(camera_id)
+    with privacy_lock:
+        recorder.clear_camera(camera_id)
+    return {"message": "Camera removed"}
+
+
+@app.post("/cameras/{camera_id}/roi")
+def save_camera_roi(camera_id: str, data: RoiInput):
+    update_camera(camera_id, CameraUpdate(roi_points=data.points))
+    return {"status": "success", "roi_points": data.points}
+
+
+@app.get("/cameras/{camera_id}/roi")
+def get_camera_roi(camera_id: str):
+    camera = camera_manager.get_camera(camera_id)
+    if camera is None:
+        raise HTTPException(404, "Camera not found")
+    return {"points": camera["roi_points"]}
+
+
+known_face_encodings = []
+known_face_names = []
+known_face_types = []
+faces_lock = threading.Lock()
+
+
+def load_known_faces():
+    global known_face_encodings, known_face_names, known_face_types
+    if not FACE_REC_AVAILABLE:
+        return
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute("SELECT name, type, encoding FROM faces").fetchall()
+    entries = [(name, kind, pickle.loads(blob)) for name, kind, blob in rows]
+    with faces_lock:
+        known_face_names = [row[0] for row in entries]
+        known_face_types = [row[1] for row in entries]
+        known_face_encodings = [row[2] for row in entries]
+
+
+load_known_faces()
+
+
+@app.post("/faces/register")
+async def register_face(file: UploadFile = File(...), name: str = Form(..., min_length=1, max_length=120), type: Literal["blacklist", "whitelist"] = Form("blacklist")):
+    if not FACE_REC_AVAILABLE:
+        raise HTTPException(503, "Face recognition is unavailable")
+    contents = await file.read(10 * 1024 * 1024 + 1)
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(413, "Image is larger than 10 MB")
+    image = cv2.imdecode(np.frombuffer(contents, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(422, "Upload a valid JPEG or PNG image")
+    if image.shape[0] * image.shape[1] > 20_000_000:
+        raise HTTPException(422, "Image dimensions are too large")
+    encodings = await asyncio.to_thread(face_recognition.face_encodings, cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if len(encodings) != 1:
+        return {"status": "error", "message": "No face found in image" if not encodings else "Use an image with exactly one face"}
+    face_id = str(uuid.uuid4())
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT INTO faces (id,name,type,encoding) VALUES (?,?,?,?)", (face_id, name.strip(), type, pickle.dumps(encodings[0])))
+    load_known_faces()
+    return {"status": "success", "message": f"Face registered: {name}"}
+
+
+@app.get("/faces")
+def get_faces():
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute("SELECT id,name,type FROM faces ORDER BY name").fetchall()
+    return [{"id": row[0], "name": row[1], "type": row[2]} for row in rows]
+
+
+@app.delete("/faces/{face_id}")
+def delete_face(face_id: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        count = conn.execute("DELETE FROM faces WHERE id=?", (face_id,)).rowcount
+    if not count:
+        raise HTTPException(404, "Face not found")
+    load_known_faces()
+    return {"status": "success", "message": "Face deleted successfully"}
 def update_heatmap(cam_data, center_x, center_y, frame_shape):
     if cam_data.get("heatmap_accumulator") is None or cam_data["heatmap_accumulator"].shape[:2] != frame_shape[:2]:
         cam_data["heatmap_accumulator"] = np.zeros(frame_shape[:2], dtype=np.float32)
@@ -113,469 +634,13 @@ def get_heatmap_overlay(cam_data, frame):
     if cam_data.get("heatmap_accumulator") is None: return frame
     msg_max = np.max(cam_data["heatmap_accumulator"])
     if msg_max == 0: return frame
-    
+
     norm_heatmap = cam_data["heatmap_accumulator"] / msg_max
     norm_heatmap = (norm_heatmap * 255).astype(np.uint8)
     color_map = cv2.applyColorMap(norm_heatmap, cv2.COLORMAP_JET)
     result = cv2.addWeighted(frame, 0.7, color_map, 0.3, 0)
     return result
 
-# --- Face ID Logic ---
-known_face_encodings = []
-known_face_names = []
-known_face_types = [] # 'blacklist' or 'whitelist'
-faces_lock = threading.Lock()
-
-def load_known_faces():
-    global known_face_encodings, known_face_names, known_face_types
-    if not FACE_REC_AVAILABLE: return
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT name, type, encoding FROM faces")
-        rows = c.fetchall()
-        
-        temp_encodings = []
-        temp_names = []
-        temp_types = []
-        for row in rows:
-            name, f_type, encoding_blob = row
-            encoding = pickle.loads(encoding_blob)
-            temp_encodings.append(encoding)
-            temp_names.append(name)
-            temp_types.append(f_type)
-        conn.close()
-        
-        with faces_lock:
-            known_face_encodings = temp_encodings
-            known_face_names = temp_names
-            known_face_types = temp_types
-            
-        print(f"Loaded {len(known_face_names)} faces.")
-    except Exception as e:
-        print(f"Error loading faces: {e}")
-
-load_known_faces()
-
-# --- API Endpoints ---
-
-
-@app.post("/faces/register")
-async def register_face(file: UploadFile = File(...), name: str = Form(...), type: str = Form("blacklist")):
-    if not FACE_REC_AVAILABLE: return {"status": "error", "message": "Face Rec not available"}
-    temp_filename = f"temp_{uuid.uuid4()}.jpg"
-    try:
-        with open(temp_filename, "wb") as buffer:
-            buffer.write(await file.read())
-        
-        image = face_recognition.load_image_file(temp_filename)
-        encodings = face_recognition.face_encodings(image)
-        
-        if len(encodings) > 0:
-            encoding = encodings[0]
-            encoding_blob = pickle.dumps(encoding)
-            face_id = str(uuid.uuid4())
-            
-            conn = sqlite3.connect(DB_NAME)
-            c = conn.cursor()
-            c.execute("INSERT INTO faces VALUES (?,?,?,?)", (face_id, name, type, encoding_blob))
-            conn.commit()
-            conn.close()
-            
-            load_known_faces() # Reload
-            return {"status": "success", "message": f"Face registered: {name}"}
-        else:
-            return {"status": "error", "message": "No face found in image"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-
-@app.get("/faces")
-async def get_faces():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT id, name, type FROM faces")
-        rows = c.fetchall()
-        conn.close()
-        return [{"id": r[0], "name": r[1], "type": r[2]} for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-
-# --- API Endpoints ---
-
-@app.get("/settings")
-async def get_settings():
-    return current_settings
-
-@app.post("/settings")
-async def save_settings(settings: SettingsModel):
-    global current_settings, roi_points
-    current_settings = settings
-    roi_points = settings.roiPoints # Update global ROI
-    
-    from dotenv import set_key
-    env_path = ".env"
-    if not os.path.exists(env_path):
-        open(env_path, 'a').close()
-        
-    if settings.senderPassword and settings.senderPassword != "********":
-        set_key(env_path, "SMTP_PASSWORD", settings.senderPassword)
-    if settings.telegramBotToken and settings.telegramBotToken != "********":
-        set_key(env_path, "TELEGRAM_BOT_TOKEN", settings.telegramBotToken)
-        
-    safe_settings = settings.dict()
-    # Mask sensitive data in JSON
-    safe_settings["senderPassword"] = ""
-    safe_settings["telegramBotToken"] = ""
-    
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(safe_settings, f, indent=4)
-        
-    load_dotenv(override=True)
-    return {"status": "success", "message": "Settings saved"}
-
-@app.post("/roi")
-async def save_roi(data: dict):
-    global roi_points, current_settings
-    if "points" in data:
-        roi_points = data["points"]
-        current_settings.roiPoints = roi_points
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(current_settings.dict(), f, indent=4)
-        print(f"ROI Updated: {roi_points}")
-        return {"status": "success"}
-    return {"status": "error"}
-
-@app.get("/roi")
-async def get_roi():
-    return {"points": roi_points}
-
-
-@app.post("/settings/test")
-async def test_settings(settings: SettingsModel):
-    original_settings = current_settings.copy()
-    
-    if settings.emailEnabled:
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = settings.senderEmail
-            msg['To'] = settings.receiverEmail
-            msg['Subject'] = "Theft Detection - Test Email"
-            msg.attach(MIMEText("This is a test email from your Theft Detection System.", 'plain'))
-            server = smtplib.SMTP(settings.smtpServer, int(settings.smtpPort))
-            server.starttls()
-            server.login(settings.senderEmail, settings.senderPassword)
-            server.send_message(msg)
-            server.quit()
-        except Exception as e:
-            return {"status": "error", "message": f"Email Test Failed: {str(e)}"}
-
-    if settings.telegramEnabled:
-        try:
-            url = f"https://api.telegram.org/bot{settings.telegramBotToken}/sendMessage"
-            data = {"chat_id": settings.telegramChatId, "text": "Theft Detection - Test Message"}
-            resp = requests.post(url, data=data)
-            if resp.status_code != 200:
-                 return {"status": "error", "message": f"Telegram Test Failed: {resp.text}"}
-        except Exception as e:
-            return {"status": "error", "message": f"Telegram Test Failed: {str(e)}"}
-            
-    return {"status": "success", "message": "All enabled tests sent successfully!"}
-
-
-
-@app.delete("/faces/{face_id}")
-async def delete_face(face_id: str):
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute("DELETE FROM faces WHERE id = ?", (face_id,))
-        conn.commit()
-        conn.close()
-        load_known_faces() # Reload
-        return {"status": "success", "message": "Face deleted successfully"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/history")
-async def get_history():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM alerts ORDER BY timestamp DESC LIMIT 100")
-        rows = c.fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
-    except Exception as e:
-        return {"error": str(e)}
-
-# --- Video Logic ---
-
-# Global variables
-roi_points = []
-roi_entry_times = {}
-LOITERING_THRESHOLD = 5.0
-last_alert_time = 0
-ALERT_COOLDOWN = 3.0
-latest_frame = None
-alert_payload = None # Initialize
-lock = threading.Lock()
-clients = []
-
-if not os.path.exists("alerts"):
-    os.makedirs("alerts")
-
-# --- Threaded Camera Stream ---
-class ThreadedCamera:
-    def __init__(self, src):
-        self.src = src
-        try:
-            self.src_val = int(src)
-            is_index = True
-        except:
-            self.src_val = src
-            is_index = False
-
-        if is_index and os.name == 'nt':
-            self.cap = cv2.VideoCapture(self.src_val, cv2.CAP_DSHOW)
-        else:
-            self.cap = cv2.VideoCapture(self.src_val)
-
-        if self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self.ret, self.frame = self.cap.read()
-        else:
-            self.ret = False
-            self.frame = None
-
-        self.running = True
-        self.lock = threading.Lock()
-        self.thread = threading.Thread(target=self.update, args=(), daemon=True)
-        if self.cap.isOpened():
-            self.thread.start()
-
-    def update(self):
-        while self.running:
-            if self.cap.isOpened():
-                ret, frame = self.cap.read()
-                with self.lock:
-                    self.ret = ret
-                    if ret:
-                        self.frame = frame
-                time.sleep(0.01)
-            else:
-                time.sleep(0.1)
-
-    def read(self):
-        with self.lock:
-            if self.frame is not None:
-                return self.ret, self.frame.copy()
-            return False, None
-
-    def isOpened(self):
-        return self.cap.isOpened()
-
-    def release(self):
-        self.running = False
-        self.cap.release()
-
-# --- Camera Management ---
-class CameraManager:
-    def __init__(self):
-        self.cameras = {}
-        self.lock = threading.Lock()
-        self.load_cameras()
-
-    def load_cameras(self):
-        file_path = "cameras.json"
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for cam in data:
-                        self.add_camera_internal(cam["id"], cam["source"], cam["name"], cam.get("roi_points", []))
-                print(f"Loaded {len(self.cameras)} cameras from cameras.json.")
-                return
-            except Exception as e:
-                print(f"Error loading cameras.json: {e}")
-
-        # Fallback to default webcam if no file exists
-        self.add_camera_internal("0", "0", "Kamera 1", [])
-        self.save_cameras()
-
-    def save_cameras(self):
-        file_path = "cameras.json"
-        try:
-            data = []
-            with self.lock:
-                for cam_id, cam_data in self.cameras.items():
-                    data.append({
-                        "id": cam_id,
-                        "name": cam_data["name"],
-                        "source": cam_data["source"],
-                        "roi_points": cam_data.get("roi_points", [])
-                    })
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4)
-        except Exception as e:
-            print(f"Error saving cameras.json: {e}")
-
-    def add_camera_internal(self, cam_id, source, name, roi_points):
-        threaded_cap = ThreadedCamera(source)
-        self.cameras[cam_id] = {
-            "cap": threaded_cap,
-            "name": name,
-            "source": source,
-            "status": "active" if threaded_cap.isOpened() else "error",
-            "roi_points": roi_points,
-            "heatmap_accumulator": None,
-            "roi_entry_times": {},
-            "last_alert_time": 0
-        }
-
-    def add_camera(self, source, name):
-        cam_id = str(uuid.uuid4())
-        threaded_cap = ThreadedCamera(source)
-        if threaded_cap.isOpened():
-            with self.lock:
-                self.cameras[cam_id] = {
-                    "cap": threaded_cap,
-                    "name": name,
-                    "source": source,
-                    "status": "active",
-                    "roi_points": [],
-                    "heatmap_accumulator": None,
-                    "roi_entry_times": {},
-                    "last_alert_time": 0
-                }
-            self.save_cameras()
-            print(f"Kamera eklendi: {name} ({source}) ID: {cam_id}")
-            return {"id": cam_id, "status": "connected"}
-        else:
-            print(f"Kamera açılamadı: {source}")
-            return {"id": None, "status": "failed"}
-
-    def remove_camera(self, cam_id):
-        with self.lock:
-            if cam_id in self.cameras:
-                self.cameras[cam_id]["cap"].release()
-                del self.cameras[cam_id]
-                status = True
-            else:
-                status = False
-        if status:
-            self.save_cameras()
-        return status
-
-    def get_active_cameras(self):
-        with self.lock:
-            return [{
-                "id": k, 
-                "name": v["name"], 
-                "source": v["source"], 
-                "status": "active" if v["cap"].isOpened() else "error",
-                "roi_points": v.get("roi_points", [])
-            } for k, v in self.cameras.items()]
-
-camera_manager = CameraManager()
-
-# --- API Endpoints for Cameras ---
-class CameraInput(BaseModel):
-    name: str
-    source: str
-
-@app.post("/cameras")
-async def add_new_camera(cam: CameraInput):
-    result = camera_manager.add_camera(cam.source, cam.name)
-    if result["id"]:
-        with camera_manager.lock:
-            cam_data = camera_manager.cameras.get(result["id"])
-            cam_details = {
-                "id": result["id"],
-                "name": cam_data["name"] if cam_data else cam.name,
-                "source": cam_data["source"] if cam_data else cam.source,
-                "status": "active"
-            } if cam_data else None
-        return {"message": "Camera added", "camera": cam_details}
-    else:
-        raise HTTPException(status_code=400, detail="Failed to open camera")
-
-@app.get("/stats")
-def get_stats():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT substr(timestamp, 1, 8), count(*) FROM alerts GROUP BY substr(timestamp, 1, 8)")
-    data = dict(c.fetchall())
-    conn.close()
-    
-    stats = []
-    from datetime import timedelta
-    today = datetime.now()
-    for i in range(6, -1, -1):
-        d = today - timedelta(days=i)
-        key = d.strftime("%Y%m%d")
-        stats.append(data.get(key, 0))
-
-    cpu_load = 0
-    ram_load = 0
-    if PSUTIL_AVAILABLE:
-        try:
-            cpu_load = psutil.cpu_percent()
-            ram_load = psutil.virtual_memory().percent
-        except:
-            import random
-            cpu_load = random.randint(15, 30)
-            ram_load = random.randint(40, 50)
-    else:
-        import random
-        cpu_load = random.randint(15, 30)
-        ram_load = random.randint(40, 50)
-        
-    return {
-        "weekly_data": stats,
-        "cpu_load": cpu_load,
-        "ram_load": ram_load
-    }
-
-@app.get("/cameras")
-async def list_cameras():
-    return camera_manager.get_active_cameras()
-
-@app.delete("/cameras/{camera_id}")
-async def delete_camera(camera_id: str):
-    if camera_manager.remove_camera(camera_id):
-        return {"message": "Camera removed"}
-    raise HTTPException(status_code=404, detail="Camera not found")
-
-@app.post("/cameras/{camera_id}/roi")
-async def save_camera_roi(camera_id: str, data: dict):
-    if "points" in data:
-        points = data["points"]
-        with camera_manager.lock:
-            if camera_id in camera_manager.cameras:
-                camera_manager.cameras[camera_id]["roi_points"] = points
-                camera_manager.save_cameras()
-                return {"status": "success", "roi_points": points}
-        raise HTTPException(status_code=404, detail="Camera not found")
-    raise HTTPException(status_code=400, detail="Invalid data")
-
-@app.get("/cameras/{camera_id}/roi")
-async def get_camera_roi(camera_id: str):
-    with camera_manager.lock:
-        if camera_id in camera_manager.cameras:
-            return {"points": camera_manager.cameras[camera_id].get("roi_points", [])}
-    raise HTTPException(status_code=404, detail="Camera not found")
-
-
-
-# --- State Tracker for Concealment ---
 class PersonState:
     def __init__(self, track_id):
         self.track_id = track_id
@@ -586,16 +651,23 @@ class PersonState:
         self.last_holding_time = 0
         self.face_checked = False
         self.face_check_time = 0
+        self.bending_hits = 0
+        self.concealment_hits = 0
+        self.last_alerts = {}
+        self.retain_seconds = 60
 
-person_states = {} # {(cam_id, track_id): PersonState}
+    def reset_presence(self):
+        self.bending_hits = 0
+        self.concealment_hits = 0
+        self.holding_object = False
+        self.holding_hand = None
 
-# --- Helper Functions for Pose ---
 def check_reaching(keypoints, roi_poly):
     if len(keypoints) < 11: return False, None
     left_wrist = keypoints[9]
     right_wrist = keypoints[10]
     reaching_hand = None
-    
+
     if left_wrist[0] > 0 and left_wrist[1] > 0 and len(roi_poly) >= 3:
         if cv2.pointPolygonTest(np.array(roi_poly), (int(left_wrist[0]), int(left_wrist[1])), False) >= 0:
             reaching_hand = "LEFT"
@@ -603,30 +675,30 @@ def check_reaching(keypoints, roi_poly):
     if right_wrist[0] > 0 and right_wrist[1] > 0 and len(roi_poly) >= 3:
         if cv2.pointPolygonTest(np.array(roi_poly), (int(right_wrist[0]), int(right_wrist[1])), False) >= 0:
             reaching_hand = "RIGHT"
-            
+
     return (reaching_hand is not None), reaching_hand
 
 def check_object_in_hand(keypoints, object_boxes, hand="LEFT"):
     # Check if any object box is close to the specified wrist
     if len(keypoints) < 11: return False
     wrist = keypoints[9] if hand == "LEFT" else keypoints[10]
-    
+
     if wrist[0] == 0: return False
-    
+
     for box in object_boxes:
         # Box: x1, y1, x2, y2
         # Check distance from wrist to box center
         box_cx = (box[0] + box[2]) / 2
         box_cy = (box[1] + box[3]) / 2
-        
+
         dist = np.sqrt((wrist[0] - box_cx)**2 + (wrist[1] - box_cy)**2)
-        
+
         # If wrist is CLOSE to object center (e.g. < 100px) OR wrist is INSIDE box
         if dist < 120: # Threshold
             return True
         if box[0] < wrist[0] < box[2] and box[1] < wrist[1] < box[3]:
             return True
-            
+
     return False
 
 def check_concealment(keypoints, reaching_hand):
@@ -634,19 +706,19 @@ def check_concealment(keypoints, reaching_hand):
     left_hip = keypoints[11]
     right_hip = keypoints[12]
     target_wrist = keypoints[9] if reaching_hand == "LEFT" else keypoints[10]
-    
+
     if target_wrist[0] == 0 or left_hip[0] == 0 or right_hip[0] == 0: return False
-    
+
     hip_center_x = (left_hip[0] + right_hip[0]) / 2
     hip_center_y = (left_hip[1] + right_hip[1]) / 2
-    
+
     dist_x = target_wrist[0] - hip_center_x
     dist_y = target_wrist[1] - hip_center_y
     distance = np.sqrt(dist_x**2 + dist_y**2)
-    
+
     hip_width = np.abs(left_hip[0] - right_hip[0])
-    threshold = max(hip_width * 1.5, 100) 
-    
+    threshold = max(hip_width * 1.5, 100)
+
     return distance < threshold
 
 def check_bending(keypoints):
@@ -657,377 +729,404 @@ def check_bending(keypoints):
     vertical_dist = l_hip[1] - l_shoulder[1]
     return vertical_dist < 50
 
-# --- Updated Video Loop ---
-def video_loop():
-    global latest_frame, current_settings, alert_payload, known_face_encodings, known_face_names, known_face_types, person_states
-    
-    print("Video Loop Başlatılıyor...") 
-    model_obj = None # Fallback or specialized
-    model_is_specialized = False
-    
-    try:
-        print("Loading Pose Model...")
-        model_pose = YOLO('yolov8n-pose.pt') 
-        
-        print("Loading Theft Detection Model...")
+
+person_states = {}
+
+
+def camera_zones(camera):
+    zones = list(camera.get("zones", []))
+    legacy = camera.get("roi_points", []) or roi_points
+    if len(legacy) >= 3:
+        zones.extend([
+            {"id": "legacy-restricted", "name": "ROI", "kind": "restricted", "points": legacy},
+            {"id": "legacy-loitering", "name": "ROI", "kind": "loitering", "points": legacy,
+             "loitering_seconds": camera["detection"]["loitering_seconds"]},
+        ])
+    return zones
+
+
+class VideoProcessor:
+    """One inference owner with independent camera trackers and failure boundaries."""
+
+    def __init__(self, model_factory):
+        self.model_factory = model_factory
+        custom_model = MODEL_DIR / "shoplifting.pt"
+        self.specialized = custom_model.is_file()
+        self.object_model = model_factory(str(custom_model if self.specialized else MODEL_DIR / "yolov8n.pt"))
+        self.base_pose = model_factory(str(MODEL_DIR / "yolov8n-pose.pt"))
+        self.pose_models = {}
+        self.generations = {}
+        self.configurations = {}
+        self.last_frame_versions = {}
+        # Cache redacted pixels, not JPEG payloads: every publication reapplies
+        # the current masks while holding the same lock as settings updates.
+        self.cached_frames = {}
+        self.no_signal = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.putText(self.no_signal, "SINYAL YOK", (400, 360), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
+
+    def reset_camera(self, camera_id, runtime=None, *, reset_model=True):
+        if reset_model:
+            self.pose_models.pop(camera_id, None)
+        self.last_frame_versions.pop(camera_id, None)
+        self.cached_frames.pop(camera_id, None)
+        rule_tracker.remove_camera(camera_id)
+        for key in [key for key in person_states if key[0] == camera_id]:
+            person_states.pop(key, None)
+        if runtime is not None:
+            for name in ("last_objects", "specialized_hits", "heuristic_alerts", "processed_frames"):
+                runtime.pop(name, None)
+
+    def _pose_model(self, camera_id):
+        if camera_id not in self.pose_models:
+            if self.base_pose is not None:
+                self.pose_models[camera_id], self.base_pose = self.base_pose, None
+            else:
+                self.pose_models[camera_id] = self.model_factory(str(MODEL_DIR / "yolov8n-pose.pt"))
+        return self.pose_models[camera_id]
+
+    @staticmethod
+    def _configuration(camera):
+        return json.dumps({
+            **{key: camera.get(key) for key in ("name", "privacy_masks", "roi_points", "zones", "detection")},
+            "global_roi": roi_points, "heatmap": current_settings.showHeatmap,
+        }, sort_keys=True)
+
+    def _store_events(self, camera_id, camera, frame, events, now):
+        seen = set()
+        for event in events:
+            key = (event["event_type"], event.get("track_id"), event.get("zone_id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            # Region rules have already applied per-person/zone cooldowns.
+            # Other rules retain their own per-person (or per-camera model) clock.
+            clocks = None
+            if "zone_id" not in event:
+                state = person_states.get((camera_id, event.get("track_id")))
+                clocks = state.last_alerts if state else camera["runtime"].setdefault("heuristic_alerts", {})
+                if now - clocks.get(key, -float("inf")) < camera["detection"]["cooldown_seconds"]:
+                    continue
+            saved = trigger_alert(camera_id, camera["name"], event["message"], frame,
+                                  event_type=event["event_type"])
+            if saved is not None and clocks is not None:
+                clocks[key] = now
+
+    def process_camera(self, camera_id, camera):
+        cap, runtime = camera["cap"], camera["runtime"]
+        health = cap.get_health()
+        generation = health["reconnect_attempts"]
+        configuration = self._configuration(camera)
+        if self.generations.get(camera_id) != generation:
+            self.reset_camera(camera_id, runtime)
+            self.generations[camera_id] = generation
+        elif self.configurations.get(camera_id) != configuration:
+            self.reset_camera(camera_id, runtime, reset_model=False)
+        self.configurations[camera_id] = configuration
+        ret, raw = cap.read()
+        version = (health["last_frame_at"], generation, configuration)
+        if ret and self.last_frame_versions.get(camera_id) == version and camera_id in self.cached_frames:
+            return self.cached_frames[camera_id]
+        now = time.monotonic()
+        detection = camera["detection"]
+        observed = set()
+        completed = False
+        events = []
+        rule_tracker.begin_frame(camera_id, now)
         try:
-            # Try to load specialized model first
-            model_obj = YOLO('shoplifting.pt')
-            model_is_specialized = True
-            print("Özel Hırsızlık Modeli Yüklendi! (shoplifting.pt)")
-        except:
-            print("Özel model bulunamadı, standart nesne takibine (yolov8n.pt) geçiliyor...")
-            try:
-                model_obj = YOLO('yolov8n.pt')
-            except Exception as e:
-                print(f"Standart Model de yüklenemedi: {e}")
-                model_obj = None
-
-        print("Modeller hazır.")
-    except Exception as e:
-        print(f"CRITICAL MODEL ERROR: {e}")
-        with open("error_log.txt", "a") as f:
-             f.write(f"{datetime.now()}: CRITICAL LOAD ERROR: {e}\n")
-        return
-
-    frame_count = 0
-    no_signal_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-    cv2.putText(no_signal_frame, "SINYAL YOK", (400, 360), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
-
-    while True:
-        try:
-            with camera_manager.lock:
-                current_cams = list(camera_manager.cameras.items())
-
-            frames_payload = [] 
-            
-            # Optimization: Run Object Det every 5 frames
-            run_obj_det = (frame_count % 5 == 0) and (model_obj is not None)
-            
-            for cam_id, cam_data in current_cams:
-                cap = cam_data["cap"]
-                name = cam_data["name"]
-                current_time = time.time()
-                
-                # Fetch specific camera ROI
-                cam_roi = cam_data.get("roi_points", [])
-                
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret: frame = no_signal_frame.copy()
-                else:
-                    frame = no_signal_frame.copy()
-
-                if cap.isOpened() and 'ret' in locals() and ret:
-                    
-                    # 1. POSE INFERENCE (Every Frame for tracking)
-                    results_pose = model_pose.track(frame, persist=True, verbose=False, classes=[0]) 
-                    
-                    # 2. THEFT / OBJECT INFERENCE
-                    detected_objects = []
-                    suspicious_activity_detected = False
-                    
-                    if run_obj_det:
-                        if model_is_specialized:
-                            results_obj = model_obj(frame, verbose=False, conf=0.4)
-                            if len(results_obj) > 0:
-                                boxes = results_obj[0].boxes.xyxy.cpu().numpy().astype(int)
-                                clss = results_obj[0].boxes.cls.cpu().numpy().astype(int)
-                                confs = results_obj[0].boxes.conf.cpu().numpy()
-                                
-                                for b, c, conf in zip(boxes, clss, confs):
-                                    class_name = model_obj.names[c].lower()
-                                    if "shoplift" in class_name or "suspicious" in class_name or "theft" in class_name or "fight" in class_name:
-                                        label = f"{class_name.upper()} {conf:.2f}"
-                                        cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 0, 255), 3)
-                                        cv2.putText(frame, label, (b[0], b[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                                        suspicious_activity_detected = True
-                                        
-                                        if current_time - cam_data["last_alert_time"] > ALERT_COOLDOWN:
-                                            trigger_alert(cam_id, name, f"CRIMINAL ACTIVITY: {class_name}", frame)
-                                            cam_data["last_alert_time"] = current_time
-                                    else:
-                                         cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 1)
-                        else:
-                            # Fallback Logic - Target classes for stealable items
-                            TARGET_CLASSES = [24, 25, 26, 28, 39, 40, 41, 42, 43, 67, 73, 74, 75, 76, 77, 78, 79] 
-                            results_obj = model_obj(frame, verbose=False, conf=0.3) 
-                            if len(results_obj) > 0:
-                                 boxes_obj = results_obj[0].boxes.xyxy.cpu().numpy().astype(int)
-                                 cls_obj = results_obj[0].boxes.cls.cpu().numpy().astype(int)
-                                 conf_obj = results_obj[0].boxes.conf.cpu().numpy()
-                                 
-                                 for b, c, conf in zip(boxes_obj, cls_obj, conf_obj):
-                                     if c in TARGET_CLASSES: 
-                                         detected_objects.append(b)
-                                         label = f"ITEM: {model_obj.names[c]} {conf:.2f}"
-                                         cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 165, 255), 2)
-                                         cv2.putText(frame, label, (b[0], b[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
-                    
-                    if run_obj_det:
-                        cam_data["last_objects"] = detected_objects
-                    else:
-                        detected_objects = cam_data.get("last_objects", [])
-
-                    if results_pose[0].boxes.id is not None:
-                        boxes = results_pose[0].boxes.xyxy.cpu().numpy().astype(int)
-                        track_ids = results_pose[0].boxes.id.cpu().numpy().astype(int)
-                        
-                        try:
-                            keypoints_all = results_pose[0].keypoints.xy.cpu().numpy()
-                        except:
-                            keypoints_all = []
-
-                        for i, track_id in enumerate(track_ids):
-                            box = boxes[i]
-                            kpts = keypoints_all[i] if len(keypoints_all) > i else []
-                            
-                            # Multi-camera safe tracking key
-                            state_key = (cam_id, track_id)
-                            if state_key not in person_states:
-                                person_states[state_key] = PersonState(track_id)
-                            p_state = person_states[state_key]
-                            
-                            is_bending = False
-                            is_reaching = False
-                            
-                            # --- FACE REC ---
-                            if FACE_REC_AVAILABLE and (not p_state.face_checked or (current_time - p_state.face_check_time > 2.0)):
-                                p_state.face_check_time = current_time
-                                fx1, fy1, fx2, fy2 = max(0, box[0]), max(0, box[1]), min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
-                                face_img = frame[fy1:fy2, fx1:fx2]
-                                rgb_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                                face_locs = face_recognition.face_locations(rgb_face)
-                                if face_locs:
-                                    encodings = face_recognition.face_encodings(rgb_face, face_locs)
-                                    if encodings:
-                                        with faces_lock:
-                                            matches = face_recognition.compare_faces(known_face_encodings, encodings[0], tolerance=0.5)
+            if not ret:
+                self.reset_camera(camera_id, runtime)
+                frame = self.no_signal.copy()
+            else:
+                frame = cv2.resize(raw, (1280, 720))
+                with privacy_lock:
+                    current = camera_manager.get_camera(camera_id)
+                    if current is None:
+                        return None
+                    frame = apply_privacy_masks(frame, current["privacy_masks"])
+                    recorder.add_frame(camera_id, frame)
+                poses = self._pose_model(camera_id).track(
+                    frame, persist=True, verbose=False, classes=[0], conf=detection["confidence"],
+                )[0]
+                rendered = poses.plot() if poses.keypoints is not None else frame.copy()
+                object_boxes = runtime.get("last_objects", [])
+                processed = runtime.get("processed_frames", 0)
+                runtime["processed_frames"] = processed + 1
+                if processed % 5 == 0:
+                    object_boxes = []
+                    objects = self.object_model.predict(frame, verbose=False, conf=detection["confidence"])[0]
+                    targets = {24, 25, 26, 28, 39, 40, 41, 42, 43, 67, 73, 74, 75, 76, 77, 78, 79}
+                    suspicious = False
+                    for box, cls in zip(objects.boxes.xyxy.cpu().numpy(), objects.boxes.cls.cpu().numpy()):
+                        cls = int(cls)
+                        if self.specialized:
+                            label = self.object_model.names[cls].lower()
+                            suspicious |= any(word in label for word in ("shoplift", "suspicious", "theft", "fight"))
+                        elif cls in targets:
+                            object_boxes.append(box)
+                    runtime["last_objects"] = object_boxes
+                    runtime["specialized_hits"] = runtime.get("specialized_hits", 0) + 1 if suspicious else 0
+                    if suspicious and runtime["specialized_hits"] >= detection["inertia_frames"]:
+                        events.append({"event_type": "suspicious_behavior", "message": "SUSPICIOUS ACTIVITY"})
+                if poses.boxes.id is not None and poses.keypoints is not None:
+                    boxes = poses.boxes.xyxy.cpu().numpy().astype(int)
+                    ids = poses.boxes.id.cpu().numpy().astype(int)
+                    keypoints = poses.keypoints.data.cpu().numpy()
+                    for box, track_id, kpts in zip(boxes, ids, keypoints):
+                        track_id = int(track_id)
+                        observed.add(track_id)
+                        state = person_states.setdefault((camera_id, track_id), PersonState(track_id))
+                        state.last_seen = now
+                        state.retain_seconds = max(60, detection["cooldown_seconds"])
+                        center = (int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2))
+                        update_heatmap(runtime, center[0], center[1], frame.shape)
+                        events.extend({**event, "track_id": track_id} for event in rule_tracker.evaluate_zones(
+                            camera_id, track_id, center, kpts, camera_zones(camera), detection, now, frame_shape=frame.shape,
+                        ))
+                        if FACE_REC_AVAILABLE and now - state.face_check_time > 2:
+                            state.face_check_time = now
+                            x1, y1 = max(0, box[0]), max(0, box[1])
+                            x2, y2 = min(frame.shape[1], box[2]), min(frame.shape[0], box[3])
+                            face_image = frame[y1:y2, x1:x2]
+                            if face_image.size:
+                                rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+                                locations = face_recognition.face_locations(rgb)
+                                encodings = face_recognition.face_encodings(rgb, locations)
+                                if encodings:
+                                    with faces_lock:
+                                        matches = face_recognition.compare_faces(known_face_encodings, encodings[0], tolerance=0.5)
                                         if True in matches:
-                                            match_index = matches.index(True)
-                                            match_name = known_face_names[match_index]
-                                            match_type = known_face_types[match_index]
-                                            if match_type == "blacklist":
-                                                cv2.putText(frame, f"BLACKLIST: {match_name}", (box[0], box[1]-30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 3)
-                                                if current_time - cam_data["last_alert_time"] > ALERT_COOLDOWN:
-                                                    trigger_alert(cam_id, name, f"BLACKLIST FACE: {match_name}", frame)
-                                                    cam_data["last_alert_time"] = current_time
-                                            else:
-                                                cv2.putText(frame, f"VIP: {match_name}", (box[0], box[1]-30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-                                p_state.face_checked = True
-
-                            # --- POSE & THEFT LOGIC ---
-                            is_bending = check_bending(kpts)
-                            
-                            if not model_is_specialized:
-                                left_has_obj = check_object_in_hand(kpts, detected_objects, "LEFT")
-                                right_has_obj = check_object_in_hand(kpts, detected_objects, "RIGHT")
-                                current_holding = left_has_obj or right_has_obj
-                                holding_hand = "LEFT" if left_has_obj else "RIGHT" if right_has_obj else None
-    
-                                if current_holding:
-                                    p_state.holding_object = True
-                                    p_state.last_holding_time = current_time
-                                    p_state.holding_hand = holding_hand
-                                    cv2.putText(frame, f"HOLDING ({holding_hand})", (box[0], box[1]-60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
-                                
-                                if p_state.holding_object and not current_holding:
-                                    time_since_hold = current_time - p_state.last_holding_time
-                                    if time_since_hold < 3.0: 
-                                         hand_to_check = p_state.holding_hand
-                                         if hand_to_check and check_concealment(kpts, hand_to_check):
-                                              cv2.putText(frame, "THEFT DETECTED!", (box[0], box[1]-80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-                                              cv2.rectangle(frame, (box[0], box[1]), (box[2], box[3]), (0, 0, 255), 3)
-                                              if current_time - cam_data["last_alert_time"] > ALERT_COOLDOWN:
-                                                  trigger_alert(cam_id, name, "THEFT CONFIRMED (Item Concealed)", frame)
-                                                  cam_data["last_alert_time"] = current_time
-                                                  p_state.holding_object = False 
-                                    else:
-                                        if time_since_hold > 3.0:
-                                            p_state.holding_object = False
-                                            p_state.holding_hand = None
-
-                            # --- ROI LOGIC ---
-                            is_reaching, _ = check_reaching(kpts, cam_roi)
-                            if is_reaching:
-                                cv2.putText(frame, "RESTRICTED AREA ENT!", (box[0], box[1]-40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                                if current_time - cam_data["last_alert_time"] > ALERT_COOLDOWN:
-                                     trigger_alert(cam_id, name, "RESTRICTED AREA INTRUSION", frame)
-                                     cam_data["last_alert_time"] = current_time
-
-                            if is_bending:
-                                cv2.putText(frame, "BENDING", (box[0], box[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-                            
-                            # --- LOITERING ---
-                            center_x = int((box[0] + box[2]) / 2)
-                            center_y = int((box[1] + box[3]) / 2)
-                            update_heatmap(cam_data, center_x, center_y, frame.shape)
-                            
-                            is_inside_roi = False
-                            if len(cam_roi) >= 3:
-                                if cv2.pointPolygonTest(np.array(cam_roi), (center_x, center_y), False) >= 0:
-                                    is_inside_roi = True
-                            
-                            if is_inside_roi:
-                                if track_id not in cam_data["roi_entry_times"]:
-                                    cam_data["roi_entry_times"][track_id] = time.time()
-                                duration = time.time() - cam_data["roi_entry_times"][track_id]
-                                cv2.putText(frame, f"{duration:.1f}s", (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-
-                                if duration > LOITERING_THRESHOLD:
-                                     if current_time - cam_data["last_alert_time"] > ALERT_COOLDOWN:
-                                         trigger_alert(cam_id, name, "LOITERING SUSPICION", frame)
-                                         cam_data["last_alert_time"] = current_time
+                                            index = matches.index(True)
+                                            if known_face_types[index] == "blacklist":
+                                                events.append({"event_type": "blacklisted_face", "track_id": track_id,
+                                                               "message": f"BLACKLIST FACE: {known_face_names[index]}"})
+                        if detection["concealment_enabled"] and not self.specialized:
+                            left = check_object_in_hand(kpts, object_boxes, "LEFT")
+                            right = check_object_in_hand(kpts, object_boxes, "RIGHT")
+                            if left or right:
+                                state.holding_object = True
+                                state.last_holding_time = now
+                                state.holding_hand = "LEFT" if left else "RIGHT"
+                                state.concealment_hits = 0
+                            elif state.holding_object and now - state.last_holding_time < 3:
+                                concealment = check_concealment(kpts, state.holding_hand)
+                                state.concealment_hits = state.concealment_hits + 1 if concealment else 0
+                                if state.concealment_hits >= detection["inertia_frames"]:
+                                    events.append({"event_type": "item_concealment", "track_id": track_id,
+                                                   "message": "ITEM CONCEALMENT SUSPICION"})
+                                    state.holding_object = False
                             else:
-                                if track_id in cam_data["roi_entry_times"]:
-                                    del cam_data["roi_entry_times"][track_id]
+                                state.holding_object = False
+                                state.concealment_hits = 0
+                        else:
+                            state.concealment_hits = 0
+                            state.holding_object = False
+                        bending = detection["bending_enabled"] and check_bending(kpts)
+                        state.bending_hits = state.bending_hits + 1 if bending else 0
+                        if state.bending_hits >= detection["inertia_frames"]:
+                            events.append({"event_type": "bending", "track_id": track_id, "message": "UNUSUAL POSTURE"})
+                if current_settings.showHeatmap:
+                    rendered = get_heatmap_overlay(runtime, rendered)
+                for zone in camera_zones(camera):
+                    polygon = np.rint(scale_polygon(zone["points"], frame.shape)).astype(np.int32)
+                    cv2.polylines(rendered, [polygon], True, (0, 255, 255), 2)
+                frame = rendered
+            completed = True
+        finally:
+            present = observed if completed else set()
+            rule_tracker.end_frame(camera_id, observed_track_ids=present, now=now)
+            for (state_camera, track_id), state in person_states.items():
+                if state_camera == camera_id and track_id not in present:
+                    state.reset_presence()
+        self._store_events(camera_id, camera, frame, events, now)
+        candidate = {"camera_id": camera_id, "frame": frame, "status": health["status"]}
+        self.cached_frames[camera_id] = candidate
+        self.last_frame_versions[camera_id] = version
+        return candidate
 
-                    frame = get_heatmap_overlay(cam_data, frame) 
-                    
-                    if results_pose[0].keypoints is not None:
-                         res_plotted = results_pose[0].plot()
-                         frame = res_plotted
+    @staticmethod
+    def publish(candidates):
+        global latest_frame, alert_payload
+        # Settings edits and final publication are serialized. Even a cached or
+        # already-inferred frame cannot restore pixels hidden by a newer mask.
+        with privacy_lock:
+            payloads = []
+            for candidate in candidates:
+                current = camera_manager.get_camera(candidate["camera_id"])
+                if current is None:
+                    continue
+                frame = apply_privacy_masks(candidate["frame"], current["privacy_masks"])
+                success, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+                if success:
+                    payloads.append({"camera_id": candidate["camera_id"], "name": current["name"],
+                                     "data": base64.b64encode(jpeg).decode("ascii"), "status": candidate["status"]})
+            with lock:
+                cutoff = time.monotonic() - 30
+                while recent_alerts and recent_alerts[0][0] < cutoff:
+                    recent_alerts.popleft()
+                alerts = [event for _, event in recent_alerts]
+                alert_payload = alerts[-1] if alerts else None
+                latest_frame = {"type": "multi_frame", "cameras": payloads, "alert": alert_payload,
+                                "alerts": alerts, "audio": "siren" if alerts else None}
 
-                    if len(cam_roi) > 0:
-                        cv2.polylines(frame, [np.array(cam_roi)], isClosed=True, color=(0, 255, 255), thickness=2)
-
-                _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-                jpg_as_text = base64.b64encode(buffer).decode('utf-8')
-                
-                frames_payload.append({
-                    "camera_id": cam_id,
-                    "name": name,
-                    "data": jpg_as_text
-                })
-            
-            frame_count += 1
-            if frames_payload:
-                with lock:
-                    latest_frame = {
-                        "type": "multi_frame",
-                        "cameras": frames_payload,
-                        "alert": alert_payload,
-                        "audio": "siren" if alert_payload else None
-                    }
-                    # Clear alert_payload after packing into frame to avoid duplicate siren loops
-                    alert_payload = None
-            
-            time.sleep(0.04) 
-
-        except Exception as e:
-            print(f"Loop Error: {e}")
-            with open("error_log.txt", "a") as f:
-                f.write(f"{datetime.now()}: Loop Runtime Error: {e}\n")
-            time.sleep(1)
+    def process_cycle(self):
+        cameras = camera_manager.get_camera_snapshots()
+        camera_ids = {camera_id for camera_id, _ in cameras}
+        for camera_id in set(self.generations) - camera_ids:
+            self.reset_camera(camera_id)
+            self.generations.pop(camera_id, None)
+            self.configurations.pop(camera_id, None)
+        candidates = []
+        for camera_id, camera in cameras:
+            try:
+                candidate = self.process_camera(camera_id, camera)
+                if candidate is not None:
+                    candidates.append(candidate)
+            except Exception as exc:
+                # Never let one inference/recognition/storage failure starve
+                # subsequent cameras. Reset its incomplete observations.
+                self.reset_camera(camera_id, camera["runtime"])
+                print(f"Camera processing failed: {type(exc).__name__}")
+                candidates.append({"camera_id": camera_id, "frame": self.no_signal.copy(), "status": "error"})
+        now = time.monotonic()
+        for key in [key for key, state in person_states.items()
+                    if key[0] not in camera_ids or now - getattr(state, "last_seen", 0) > state.retain_seconds]:
+            person_states.pop(key, None)
+        self.publish(candidates)
 
 
-def trigger_alert(cam_id, cam_name, message, frame):
+def video_loop():
+    from ultralytics import YOLO
+    try:
+        processor = VideoProcessor(YOLO)
+        print("Modeller hazır.")
+    except Exception as exc:
+        print(f"Model initialization failed: {type(exc).__name__}")
+        return
+    while not stop_event.is_set():
+        try:
+            processor.process_cycle()
+        except Exception as exc:
+            print(f"Video publication failed: {type(exc).__name__}")
+            stop_event.wait(1)
+        stop_event.wait(0.04)
+
+
+def trigger_alert(cam_id, cam_name, message, frame, event_type="suspicious_behavior"):
     global alert_payload
-    try:
-        print(f"ALERT: {message}")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"alerts/alert_{cam_id}_{timestamp}.jpg"
-        cv2.imwrite(filename, frame)
-        
-        # database
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        alert_id = str(uuid.uuid4())
-        c.execute("INSERT INTO alerts VALUES (?,?,?,?)", (alert_id, message, timestamp, filename))
-        conn.commit()
-        conn.close()
-        
+    with privacy_lock:
+        current = camera_manager.get_camera(cam_id)
+        if current is None:
+            return None
+        frame = apply_privacy_masks(frame, current["privacy_masks"])
+        event_id = str(uuid.uuid4())
+        filename = EVIDENCE_DIR / f"alert_{event_id}.jpg"
+        if not cv2.imwrite(str(filename), frame):
+            raise RuntimeError("Could not save event snapshot")
+        try:
+            event = event_store.create_event(event_id=event_id, message=message, image_path=public_evidence_path(filename),
+                                            camera_id=cam_id, camera_name=current["name"], event_type=event_type)
+        except Exception:
+            filename.unlink(missing_ok=True)
+            raise
+        settings = current_settings.model_copy(deep=True)
+        if settings.clipEnabled:
+            event_store.set_clip(event_id, "", "pending")
+            try:
+                recorder.trigger(event_id, cam_id)
+            except Exception:
+                event_store.set_clip(event_id, "", "failed")
+                print("Event clip could not be scheduled.")
         with lock:
-            alert_payload = {
-                "id": alert_id,
-                "message": message,
-                "timestamp": timestamp,
-                "image_path": filename,
-                "camera_id": cam_id
-            }
-            
-        # Send Email/Telegram if enabled (Settings)
-        # We can implement a fire-and-forget thread for this to not block loop
-        threading.Thread(target=send_notifications, args=(message, filename)).start()
-        
-    except Exception as e:
-        print(f"Alert Error: {e}")
+            alert_payload = event
+            recent_alerts.append((time.monotonic(), event))
+    if (settings.emailEnabled or settings.telegramEnabled) and notification_slots.acquire(blocking=False):
+        try:
+            future = notification_pool.submit(send_notification, message, filename, settings)
+        except RuntimeError:
+            notification_slots.release()
+        else:
+            # A future cancelled during shutdown never executes its body.
+            future.add_done_callback(lambda _future: notification_slots.release())
+    return event
 
-def send_notifications(message, image_path):
-    try:
-        if current_settings.emailEnabled:
-            sender_email = os.getenv("SENDER_EMAIL", current_settings.senderEmail)
-            sender_password = os.getenv("SMTP_PASSWORD", current_settings.senderPassword)
-            if sender_email and sender_password:
-                msg = MIMEMultipart()
-                msg['From'] = sender_email
-                msg['To'] = current_settings.receiverEmail
-                msg['Subject'] = "Theft Guard AI - Security Alert"
-                
-                body = f"ALERT: {message}\nTimestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                msg.attach(MIMEText(body, 'plain'))
-                
-                try:
-                    with open(image_path, 'rb') as f:
-                        img_data = f.read()
-                        image = MIMEImage(img_data, name=os.path.basename(image_path))
-                        msg.attach(image)
-                except Exception as img_e:
-                    print(f"Could not attach image: {img_e}")
-                
-                server = smtplib.SMTP(current_settings.smtpServer, int(current_settings.smtpPort))
-                server.starttls()
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-                server.quit()
-                print("Email notification sent.")
 
-        if current_settings.telegramEnabled:
-            bot_token = os.getenv("TELEGRAM_BOT_TOKEN", current_settings.telegramBotToken)
-            chat_id = current_settings.telegramChatId
-            if bot_token and chat_id:
-                url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
-                with open(image_path, 'rb') as photo:
-                    data = {"chat_id": chat_id, "caption": f"🚨 THEFT GUARD ALERT 🚨\n\n{message}"}
-                    files = {"photo": photo}
-                    resp = requests.post(url, data=data, files=files)
-                if resp.status_code == 200:
-                    print("Telegram notification sent.")
-                else:
-                    print(f"Telegram Error: {resp.text}")
-    except Exception as e:
-        print(f"Notification Error: {e}")
+def send_notification(message, image_path, settings, strict=False):
+    attach_image = settings.includeImagesInNotifications and image_path is not None
+
+    def email_notification():
+        password = settings.senderPassword
+        if not password or password == "********":
+            password = os.environ.get("SMTP_PASSWORD", "")
+        sender = settings.senderEmail or os.environ.get("SENDER_EMAIL", "")
+        if not sender or not password:
+            raise ValueError("Email credentials missing")
+        email = MIMEMultipart()
+        email["From"], email["To"] = sender, settings.receiverEmail
+        email["Subject"] = "TheftGuard Security Alert"
+        email.attach(MIMEText(f"{message}\n{datetime.now(timezone.utc).isoformat()}", "plain"))
+        if attach_image:
+            email.attach(MIMEImage(Path(image_path).read_bytes(), name=Path(image_path).name))
+        with smtplib.SMTP(settings.smtpServer, int(settings.smtpPort), timeout=15) as server:
+            server.starttls(context=ssl.create_default_context())
+            server.login(sender, password)
+            server.send_message(email)
+
+    def telegram_notification():
+        token = settings.telegramBotToken
+        if not token or token == "********":
+            token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if not token or not settings.telegramChatId:
+            raise ValueError("Telegram credentials missing")
+        method = "sendPhoto" if attach_image else "sendMessage"
+        data = {"chat_id": settings.telegramChatId, "caption" if attach_image else "text": message}
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        if attach_image:
+            with open(image_path, "rb") as image:
+                response = requests.post(url, data=data, files={"photo": image}, timeout=15)
+        else:
+            response = requests.post(url, data=data, timeout=15)
+        response.raise_for_status()
+
+    results = {}
+    for name, enabled, deliver in (("email", settings.emailEnabled, email_notification),
+                                   ("telegram", settings.telegramEnabled, telegram_notification)):
+        if enabled:
+            try:
+                deliver()
+                results[name] = "sent"
+            except Exception:
+                results[name] = "failed"
+                print(f"{name.capitalize()} notification failed; check destination and credentials.")
+    failures = [name for name, result in results.items() if result == "failed"]
+    if strict and failures:
+        raise RuntimeError("Notification delivery failed: " + ", ".join(failures))
+    return results
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    origin = websocket.headers.get("origin")
+    token = websocket.cookies.get(SESSION_COOKIE, "")
+    if (origin and origin.rstrip("/") not in ALLOWED_ORIGINS) or auth_store.get_session(token) is None:
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
-    print("Client connected")
+    next_session_check = 0
     try:
-        while True:
-            # Send latest frame
-            message_to_send = None
+        while not stop_event.is_set():
+            if time.monotonic() >= next_session_check:
+                if auth_store.get_session(token) is None:
+                    await websocket.close(code=4401)
+                    return
+                next_session_check = time.monotonic() + 5
             with lock:
-                if latest_frame:
-                    message_to_send = json.dumps(latest_frame)
-            
-            if message_to_send:
-                await websocket.send_text(message_to_send)
+                payload = latest_frame or {"type": "multi_frame", "cameras": [], "alert": None, "audio": None}
+            await websocket.send_json(payload)
+            await asyncio.sleep(0.1)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
 
-            await asyncio.sleep(0.04) 
-    except WebSocketDisconnect:
-        print("Client disconnected")
-    except Exception as e:
-        print(f"Error: {e}")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    t = threading.Thread(target=video_loop, daemon=True)
-    t.start()
-    yield
-
-app.router.lifespan_context = lifespan
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=os.environ.get("BIND_HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")))

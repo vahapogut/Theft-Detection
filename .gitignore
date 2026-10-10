@@ -8,6 +8,8 @@ env/
 
 # Database
 theft_detection.db
+theft_detection.db-*
+data/
 
 # Security, Alerts & Configs
 alerts/

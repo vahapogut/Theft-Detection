@@ -2,17 +2,24 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, History, Settings, Users, Video } from "lucide-react";
+import { useState } from "react";
+import { LayoutDashboard, History, Settings, Users, Video, ShieldCheck, LogOut } from "lucide-react";
+import { useAuth } from "@/components/AuthProvider";
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const { user, logout, canAdmin, canOperate } = useAuth();
+  const [error, setError] = useState("");
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  if (pathname === "/login" || !user) return null;
 
   const links = [
     { href: "/", label: "Overview", icon: LayoutDashboard },
     { href: "/cameras", label: "Cameras", icon: Video },
-    { href: "/faces", label: "Faces", icon: Users },
+    ...(canOperate ? [{ href: "/faces", label: "Faces", icon: Users }] : []),
     { href: "/history", label: "Alert History", icon: History },
-    { href: "/settings", label: "Settings", icon: Settings },
+    ...(canAdmin ? [{ href: "/settings", label: "Settings", icon: Settings }, { href: "/users", label: "Kullanıcılar", icon: ShieldCheck }] : []),
   ];
 
   return (
@@ -47,11 +54,15 @@ export default function Sidebar() {
 
       <div className="mt-auto pt-8 pb-4">
         <div className="px-4 py-3 rounded-lg bg-black/20 border border-glass-border">
-          <div className="text-xs text-foreground/50 uppercase tracking-wider mb-1">System Status</div>
-          <div className="flex items-center gap-2 text-sm text-green-400">
-            <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
-            Online & Active
-          </div>
+          <div className="truncate text-sm font-medium">{user.username}</div>
+          <div className="mt-1 text-xs text-foreground/50">{user.role === "admin" ? "Yönetici" : user.role === "operator" ? "Operatör" : "İzleyici"}</div>
+          <button disabled={loggingOut} type="button" onClick={async () => {
+            setLoggingOut(true);
+            setError("");
+            try { await logout(); } catch (cause) { setError(cause instanceof Error ? cause.message : "Çıkış yapılamadı."); }
+            finally { setLoggingOut(false); }
+          }} className="mt-3 flex items-center gap-2 text-sm text-foreground/70 hover:text-foreground disabled:opacity-50"><LogOut className="h-4 w-4" />{loggingOut ? "Çıkış yapılıyor…" : "Çıkış yap"}</button>
+          {error && <p role="alert" className="mt-2 text-xs text-red-400">{error}</p>}
         </div>
       </div>
     </aside>

@@ -1,194 +1,155 @@
-# TheftGuard AI - Advanced Anti-Theft AI Security System
+# TheftGuard
 
-TheftGuard AI is an advanced, enterprise-grade video surveillance and anti-theft security solution designed for retail spaces, supermarkets, and smart facilities. It utilizes cutting-edge Computer Vision, real-time Pose Estimation, Object Detection, and Facial Recognition algorithms to detect shoplifting, loitering, restricted area intrusions, and fighting. 
+Kamera görüntülerindeki şüpheli hareketleri, bölge ihlallerini ve bekleme davranışlarını incelemek için Python/FastAPI ve Next.js tabanlı güvenlik paneli.
 
-The system leverages optimized, multi-threaded pipelines to analyze concurrent camera feeds (local webcams or RTSP network cameras) synchronously, triggering instant browser-synthesized audio sirens and sending remote alerts via Email and Telegram.
+![Dashboard](docs/dashboard.png)
 
-**Live Demo:** [theft-detection-dusky.vercel.app](https://theft-detection-dusky.vercel.app/)
+## Özellikler
 
-[![TheftGuard Dashboard Showcase](docs/dashboard.png)](https://theft-detection-dusky.vercel.app/)
+- Çoklu kamera, kesinti sonrası otomatik yeniden bağlanma, bağlantı durumu, son kare zamanı ve FPS.
+- YOLO nesne/poz tespiti ve kamera başına ayrı takip durumu.
+- Kamera bazında güven eşiği, ardışık kare koşulu, alarm tekrar aralığı ve kural anahtarları.
+- Adlandırılmış yasaklı alan/bekleme bölgeleri ve bölgeye özel süreler.
+- Görüntü analizinden, canlı yayından ve kayıttan önce uygulanan gizlilik maskeleri.
+- Olay inceleme durumları, notlar, arşiv koruması, tarih/kamera/tür/durum filtreleri ve gerçek sayfalama.
+- Filtrelenen tüm olayların CSV çıktısı; JPEG görüntü ve alarm öncesi/sonrası H.264 MP4 klip.
+- Silmeden önizlenen, arşivleri koruyan saklama temizliği.
+- Gerçek veritabanı verilerinden saatlik/haftalık grafikler ve sistem kaynak ölçümleri.
+- Yönetici, operatör ve gözlemci rolleri; API, WebSocket ve kanıt dosyalarında oturum kontrolü.
+- Yüz listeleri; isteğe bağlı e-posta/Telegram bildirimleri ve görüntü ekini kapatma seçeneği.
 
----
+[Kaynaklı özellik karşılaştırması ve sınırlar](docs/FEATURE_COMPARISON.md)
 
-## Premium System Capabilities & Key Features
+Algılama sonuçları insan incelemesine yönelik şüphe kayıtlarıdır. Model çıktısı tek başına doğrulanmış bir hırsızlık kararı değildir.
 
-### 1. Multi-Threaded Camera Architecture
-*   **Asynchronous Frame Reading:** Captures frames independently via high-performance python threading (`ThreadedCamera`), avoiding sequential frame capture lag or UI freezes.
-*   **Robust Multi-Camera Tracking:** Dynamically resolves tracker ID conflicts across multiple feeds simultaneously by isolating states uniquely using camera-to-person composites `(camera_id, track_id)`.
+## Gereksinimler
 
-### 2. Interactive Canvas ROI Drawer
-*   **HTML5 Canvas Drawing Tool:** Draw precise security boundaries (Polygons) overlaying live webcam/RTSP feeds directly inside a glassmorphic dashboard modal.
-*   **Resolution-Agnostic Scaling:** Autonomously maps client-side mouse vectors into exact `1280x720` surveillance matrix coordinates, preventing scaling discrepancies across different screen resolutions.
-*   **Camera-Specific Storage:** Camera definitions and their respective ROI coordinate lists are saved persistently inside `cameras.json`.
+- Python 3.11 ve Node.js 20.9 veya daha yeni bir sürüm; Node.js LTS önerilir.
+- `dlib` kurulumu için C++ derleyicisi ve CMake.
+- Video klipleri için `libx264` kodlayıcılı FFmpeg. Kullanılabilirlik Ayarlar ekranında gösterilir.
+- CPU çalışması desteklenir; CUDA GPU isteğe bağlıdır.
 
-![Camera Setup & Configuration](docs/cameras.png)
+Dahil edilen modeller: `yolov8n.pt` ve `yolov8n-pose.pt`. İsteğe bağlı `shoplifting.pt` dosyası mevcutsa kullanılır. Yalnızca güvendiğiniz model dosyalarını yükleyin.
 
-### 3. Advanced Behavior & Posture Estimation
-*   **Item Concealment Logic:** Recognizes when a person picks up a target retail item and monitors hand-to-pocket/bag gestures, flagging potential concealment attempts.
-*   **Loitering Detection:** Evaluates how long a person dwells within a specific ROI. If loitering exceeds the configurable threshold, an alarm is triggered.
-*   **Zone Intrusion Alerts:** Instantly sounds sirens if human wrists cross into high-security zones (e.g., cash register areas, restricted aisles).
-*   **Postural Suspicion:** Detects unusual physical behavior such as sudden bending down in low-visibility aisles.
-*   **Activity Heatmaps:** Localized heatmap accumulators aggregate and visually plot customer traffic patterns individually for each camera stream.
-
-### 4. Facial Recognition & Database Panel
-*   **Face ID Classification:** A dedicated, premium **Face Management** panel to upload portrait photos, register new faces, and assign categorizations:
-    *   **Blacklist:** Automatically triggers high-priority security alarms and records evidence.
-    *   **VIP Whitelist:** Identifies trusted staff, loyal clients, or VIP visitors, showing a green greeting badge.
-*   **Instant Face Database Deletion:** One-click instant SQLite deletion with automatic memory synchronization.
-
-![Face Recognition Management](docs/faces.png)
-
-### 5. Client-Side Synthetic Audio Siren & Notifications
-*   **Web Audio API Integration:** Avoids brittle MP3 loading loops by synthesizing realistic, sweeping emergency sirens directly in the browser's audio processor in real-time when alarms fire.
-*   **High-Priority Cooldowns:** Protects users from noise fatigue by enforcing a 3-second smart alarm cooldown period.
-*   **Telegram & SMTP Setup:** Instantly broadcast alerts and snapshots via Telegram chat integrations and automated Email notifications.
-
-![Notification Settings](docs/settings.png)
-
-### 6. Centralized Glassmorphic Control Room
-*   **Performance Telemetry:** Displays dynamic CPU usage and Memory (RAM) virtual bars mapped directly from backend psutil resources.
-*   **Weekly Trends:** Integrates custom, sleek Recharts data visualizations highlighting security events categorized by "Suspicious Behavior" and "Reviewed/False Alarms".
-*   **Advanced Filtering & CSV Export:** Search historical logs by ID, message, or camera, filter by event categories, and download filtered alerts into a clean Excel/CSV file with a single click.
-
-![Alert History](docs/history.png)
-
----
-
-## Technical Architecture
-
-*   **Backend Engine:** Python 3.10+, FastAPI (Asynchronous API endpoints & WebSockets), OpenCV (Multi-threaded streaming), Ultralytics YOLOv8 (Stand-alone Pose & Object model detection), `face_recognition` (Dlib-based CNN face encodings), SQLite3 (Database storage for logs & face matrices).
-*   **Frontend Dashboard:** Next.js 14+ (App Router), React 18, Tailwind CSS, Recharts (Modern chart libraries), Lucide React (Fluent vector icons), HSL Custom Themes (Harmonious Glassmorphic Dark UI).
-
----
-
-## Installation Guide
-
-### Prerequisites
-*   Python 3.9 - 3.11
-*   Node.js (LTS version)
-*   CUDA Enabled NVIDIA GPU (Highly recommended for fluid real-time inference)
-
-### 1. Backend Configuration
-Clone the repository and install the Python dependencies:
+## Kurulum
 
 ```bash
-git clone https://github.com/vahapogut/Theft-Detection.git
-cd Theft-Detection
-pip install -r requirements.txt
-```
-
-> **Windows Note:** If `python` is not in your PATH, use the `py` launcher instead:
-> ```bash
-> py -m pip install -r requirements.txt
-> ```
-
-#### Required Models
-The system uses two pre-trained YOLOv8 models which are included in the repository:
-- `yolov8n.pt` — Object detection (person tracking, item monitoring)
-- `yolov8n-pose.pt` — Pose estimation (posture analysis, gesture detection)
-
-*Note: If you have a custom pre-trained theft detection model (`shoplifting.pt`), place it in the root directory. The system will automatically detect it and upgrade from default pose algorithms to the specialized neural net.*
-
-#### Optional Dependencies
-| Package | Purpose | Status When Missing |
-|---------|---------|---------------------|
-| `face_recognition` | Face ID & blacklist/whitelist matching | Face recognition panel disabled gracefully |
-| `psutil` | Real-time CPU/RAM monitoring | Falls back to simulated system metrics |
-
-> **Windows users:** Installing `face_recognition` on Windows requires Visual Studio Build Tools and CMake (for the `dlib` dependency). The system runs fine without it — only the face recognition tab will show no results. See [face_recognition Windows install guide](https://github.com/ageitgey/face_recognition#installation) for help.
-
-### 2. Dashboard UI Configuration
-Install node packages:
-
-```bash
+python3.11 -m venv venv
+source venv/bin/activate
+python -m pip install 'cmake<4' 'setuptools<81' wheel
+python -m pip install -r requirements.txt
 cd dashboard
-npm install
+npm ci
+cd ..
 ```
 
-### 3. Verify Installation
-Run the setup tests to confirm everything is working:
+CPU kurulumu için Python bağımlılıklarını yüklemeden önce PyTorch CPU paketlerini kurabilirsiniz:
 
 ```bash
-py test_setup.py      # Tests OpenCV + YOLO object detection
-py test_pose.py       # Tests YOLO pose model loading
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
----
+Windows'ta sanal ortamı `venv\Scripts\activate` ile etkinleştirin; C++ Build Tools gereklidir. Mevcut `start_system.bat` başlatıcısı kullanılabilir; önce aşağıdaki yönetici hesabı adımını tamamlayın.
 
-## Running the System
+## İlk yönetici hesabı
 
-### Automatic Startup (Windows)
-Launch both the FastAPI service and the Next.js development server concurrently with a single click:
+Varsayılan kullanıcı veya parola bulunmaz. Arka uçla aynı çalışma dizininde ve aynı ortam değişkenleriyle çalıştırın:
 
 ```bash
-start_system.bat
+python manage_users.py create-admin --username vahapogut
 ```
 
-The launcher will:
-1. Check and auto-install dashboard npm dependencies if missing
-2. Start the Python/FastAPI backend on `http://localhost:8000`
-3. Start the Next.js dashboard on `http://localhost:3000`
-4. Open the dashboard in your default browser
+Parola terminalde gizli olarak iki kez istenir; en az 12 karakter gerekir. Diğer hesaplar Kullanıcılar ekranından oluşturulur.
 
-### Manual Startup
-**1. Start the API Server & Inference Loop:**
 ```bash
-py backend.py
+python manage_users.py reset-password --username vahapogut
 ```
-*(The server will boot on `http://localhost:8000` — Swagger docs at `http://localhost:8000/docs`)*
 
-**2. Start the Frontend Dashboard:**
+Parola, rol veya etkinlik durumu değiştiğinde mevcut oturumlar iptal edilir. Son etkin yönetici devre dışı bırakılamaz veya daha düşük bir role geçirilemez.
+
+| Rol | İzinler |
+| --- | --- |
+| Yönetici | Tüm ekranlar; kamera, algılama, yüz, kullanıcı ve sistem ayarları; kanıt temizliği |
+| Operatör | Canlı yayın ve olayları görme, dışa aktarma, inceleme/not/arşiv işlemleri |
+| Gözlemci | Canlı yayın, olaylar, kanıtlar ve istatistikleri görme; CSV dışa aktarma |
+
+## Çalıştırma
+
+İki terminal kullanın:
+
+```bash
+# Depo kökünde, Python sanal ortamı etkinleştirilmişken
+python backend.py
+```
+
 ```bash
 cd dashboard
 npm run dev
 ```
-*(The panel will be served on `http://localhost:3000`)*
 
-**3. Optional Standalone OpenCV Window Demo:**
+Panel 3000, arka uç 8000 portunu kullanır. Tarayıcıdaki API ve WebSocket istekleri aynı kökendeki `/api` yolu üzerinden iletilir. Arka uç varsayılan olarak yalnızca `127.0.0.1` üzerinde dinler. Fiziksel kamera yoksa panelde sinyal yok görüntüsü beklenir; bağlı olmayan kamera otomatik olarak yeniden denenir.
+
+Aynı veri dizini için tek arka uç süreci çalıştırın. Yeniden başlatıldığında yarıda kalan klipler başarısız olarak işaretlenir; mevcut kanıt dosyaları korunur. Kamera yapılandırması bozuksa dosyanın üzerine yazılmaz; `cameras.json` düzeltildikten sonra uygulamayı yeniden başlatın.
+
+### Verileri ayrı bir dizinde saklama
+
+`THEFTGUARD_DATA_DIR` ayarları, kamera tanımlarını, olay veritabanını ve kanıt dosyalarını taşır. Yönetici oluşturma komutunda da aynı değişkeni kullanın. Model dosyaları varsayılan olarak depo kökünden okunur.
+
 ```bash
-py standalone_demo.py
+export THEFTGUARD_DATA_DIR="$PWD/data/runtime"
+python manage_users.py create-admin --username vahapogut
+python backend.py
 ```
 
----
+Ayrı veri dizini belirtilmezse mevcut çalışma dizini kullanılır. Eski dört sütunlu `alerts` tablosu kayıtlar korunarak otomatik genişletilir. Eski kayıtların kamera bilgisi bulunmadığından bu alanlar boş kalabilir.
 
-## Troubleshooting
+### Ortam değişkenleri
 
-### "python is not recognized" on Windows
-Use the Python launcher (`py`) instead. It's included with the official Python installer from python.org:
+| Değişken | Varsayılan / amaç |
+| --- | --- |
+| `THEFTGUARD_DATA_DIR` | Çalışma dizini; ayarlar, olay veritabanı ve kanıtlar |
+| `THEFTGUARD_MODEL_DIR` | Depo kökü; YOLO model dosyaları |
+| `AUTH_DB_PATH` | Veri dizini altında `data/auth.sqlite3`; isteğe bağlı kullanıcı veritabanı yolu |
+| `BIND_HOST`, `PORT` | `127.0.0.1`, `8000` |
+| `BACKEND_URL` | Next.js sunucusunun arka uç adresi; `http://127.0.0.1:8000` |
+| `NEXT_PUBLIC_API_URL` | Boş bırakıldığında aynı kökendeki `/api`; ayrı dağıtım için isteğe bağlı |
+| `ALLOWED_ORIGINS` | Virgülle ayrılmış izinli tarayıcı kökenleri; varsayılan `http://localhost:3000,http://127.0.0.1:3000` |
+| `SESSION_COOKIE_SECURE` | Yerelde `false`; HTTPS dağıtımında `true` |
+| `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN` | Bildirimler etkinleştirildiğinde gerekli gizli değerler |
+
+Uzak erişimde HTTPS kullanın, `ALLOWED_ORIGINS` değerini gerçek panel kökeniyle ayarlayın ve güvenli oturum çerezlerini etkinleştirin. Kamera kaynak adresleri API yanıtlarında gizlenir. Bildirim parolaları JSON ayar dosyasında veya API yanıtlarında açık olarak tutulmaz.
+
+## Olay ve saklama akışı
+
+Geçmiş ekranında olayları süzün; bir olayı incelendi veya yanlış alarm olarak işaretleyin, not ekleyin ve korunması gereken kanıtı arşivleyin. CSV dışa aktarımı yalnızca görünen sayfayı değil tüm filtrelenmiş sonuçları içerir.
+
+Ayarlar ekranında klibin alarm öncesi/sonrası süresini seçin. Kamera sayısı, klip kuyruğu ve bellek tamponu sınırlıdır; kaynak doluluğu veya kodlayıcı eksikliği sessiz bir başarılı kayıt olarak gösterilmez.
+
+Saklama temizliği otomatik çalışmaz. Önce yaş sınırıyla önizleme alın, ardından silmeyi onaylayın. Önizleme 10 dakika geçerlidir ve bir kez kullanılabilir. Aday kayıtlar veya dosyalar değişmişse yeni önizleme gerekir. Arşivlenmiş olaylar, paylaşılan kanıt dosyaları ve hazırlanmakta olan klipler korunur.
+
+Gizlilik maskesi değiştirildiğinde o kameranın eski klip tamponu ve tamamlanmamış klipleri temizlenir. Önceden tamamlanmış kanıt dosyaları geriye dönük değiştirilmez.
+
+## Doğrulama
+
 ```bash
-py backend.py
+# Depo kökünde
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+python test_setup.py
+python test_pose.py
+
+cd dashboard
+npm run lint
+npx tsc --noEmit
+npm run build
 ```
 
-### "No module named 'face_recognition'"
-This is expected on Windows unless you've manually installed dlib. The system logs a warning and disables face recognition — all other features (object detection, pose estimation, loitering, ROI, alerts) continue working normally.
+Eski `test_setup.py` ve `test_pose.py` hata yakaladığında sıfır çıkış kodu verebilir; çıktıda `SETUP_SUCCESS` ve `Model loaded successfully` işaretlerini de kontrol edin. Yeni testler geçici veritabanları, sentetik kameralar ve sahte bildirim istemcileri kullanır; dışarıya bildirim göndermez.
 
-### Camera not opening (Ctrl+C to restart)
-- Ensure no other application is using your webcam (Zoom, Teams, etc.)
-- Try changing the camera source from `0` to `1` in the Camera Setup panel
-- For RTSP streams, verify the URL format: `rtsp://username:password@ip:port/path`
+## Katkıda bulunanlar
 
-### WebSocket showing "Disconnected" in Dashboard
-- Confirm the backend is running (`http://localhost:8000/docs` should load)
-- Check Windows Firewall isn't blocking port 8000
-- Verify `NEXT_PUBLIC_API_URL=http://127.0.0.1:8000` exists in `dashboard/.env.local`
+- [vahapogut](https://github.com/vahapogut)
 
----
+## Lisans
 
-## Contributing 
-
-1. Fork this repository.
-2. Create your feature branch (`git checkout -b feature/CoolFeature`).
-3. Commit your upgrades (`git commit -m 'feat: add cool feature'`).
-4. Push to your branch (`git push origin feature/CoolFeature`).
-5. Open a Pull Request.
-
----
-
-## License
-
-Distributed under the MIT License. See `LICENSE` for more information.
-
----
-
-*Project Maintainer & Developer: **Abdulvahap Öğüt***  
-*GitHub Repository:* [vahapogut/Theft-Detection](https://github.com/vahapogut/Theft-Detection)
+[MIT](LICENSE)
