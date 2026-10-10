@@ -1,37 +1,37 @@
 # TheftGuard
 
-Kamera görüntülerindeki şüpheli hareketleri, bölge ihlallerini ve bekleme davranışlarını incelemek için Python/FastAPI ve Next.js tabanlı güvenlik paneli.
+A security dashboard built with Python/FastAPI and Next.js for reviewing suspicious activity, restricted-area intrusions, and loitering in camera feeds.
 
 ![Dashboard](docs/dashboard.png)
 
-## Özellikler
+## Features
 
-- Çoklu kamera, kesinti sonrası otomatik yeniden bağlanma, bağlantı durumu, son kare zamanı ve FPS.
-- YOLO nesne/poz tespiti ve kamera başına ayrı takip durumu.
-- Kamera bazında güven eşiği, ardışık kare koşulu, alarm tekrar aralığı ve kural anahtarları.
-- Adlandırılmış yasaklı alan/bekleme bölgeleri ve bölgeye özel süreler.
-- Görüntü analizinden, canlı yayından ve kayıttan önce uygulanan gizlilik maskeleri.
-- Olay inceleme durumları, notlar, arşiv koruması, tarih/kamera/tür/durum filtreleri ve gerçek sayfalama.
-- Filtrelenen tüm olayların CSV çıktısı; JPEG görüntü ve alarm öncesi/sonrası H.264 MP4 klip.
-- Silmeden önizlenen, arşivleri koruyan saklama temizliği.
-- Gerçek veritabanı verilerinden saatlik/haftalık grafikler ve sistem kaynak ölçümleri.
-- Yönetici, operatör ve gözlemci rolleri; API, WebSocket ve kanıt dosyalarında oturum kontrolü.
-- Yüz listeleri; isteğe bağlı e-posta/Telegram bildirimleri ve görüntü ekini kapatma seçeneği.
+- Multiple cameras with automatic reconnection, connection status, last-frame timestamps, and FPS monitoring.
+- YOLO object and pose detection with independent tracking for each camera.
+- Per-camera confidence thresholds, consecutive-frame requirements, alert cooldowns, and rule toggles.
+- Named restricted and loitering zones with individual dwell-time thresholds.
+- Privacy masks applied before analysis, live streaming, and recording.
+- Event review statuses, notes, archive protection, date/camera/type/status filters, and server-side pagination.
+- CSV export of all filtered events, JPEG snapshots, and H.264 MP4 clips with pre-event and post-event footage.
+- Retention cleanup with a deletion preview and protection for archived evidence.
+- Hourly and weekly charts based on actual database records, plus live system resource measurements.
+- Administrator, operator, and viewer roles with session checks for the API, WebSockets, and evidence files.
+- Face lists and optional email/Telegram notifications with a setting to disable image attachments.
 
-[Kaynaklı özellik karşılaştırması ve sınırlar](docs/FEATURE_COMPARISON.md)
+[Feature comparison, sources, and limitations](docs/FEATURE_COMPARISON.md)
 
-Algılama sonuçları insan incelemesine yönelik şüphe kayıtlarıdır. Model çıktısı tek başına doğrulanmış bir hırsızlık kararı değildir.
+Detections flag suspicious activity for human review. Model output alone does not establish that theft occurred.
 
-## Gereksinimler
+## Requirements
 
-- Python 3.11 ve Node.js 20.9 veya daha yeni bir sürüm; Node.js LTS önerilir.
-- `dlib` kurulumu için C++ derleyicisi ve CMake.
-- Video klipleri için `libx264` kodlayıcılı FFmpeg. Kullanılabilirlik Ayarlar ekranında gösterilir.
-- CPU çalışması desteklenir; CUDA GPU isteğe bağlıdır.
+- Python 3.11 and Node.js 20.9 or newer; Node.js LTS is recommended.
+- A C++ compiler and CMake to install `dlib`.
+- FFmpeg with the `libx264` encoder for video clips. Availability is shown in Settings.
+- CPU execution is supported; a CUDA GPU is optional.
 
-Dahil edilen modeller: `yolov8n.pt` ve `yolov8n-pose.pt`. İsteğe bağlı `shoplifting.pt` dosyası mevcutsa kullanılır. Yalnızca güvendiğiniz model dosyalarını yükleyin.
+Included models: `yolov8n.pt` and `yolov8n-pose.pt`. The optional `shoplifting.pt` model is used when present. Only load model files you trust.
 
-## Kurulum
+## Installation
 
 ```bash
 python3.11 -m venv venv
@@ -43,42 +43,42 @@ npm ci
 cd ..
 ```
 
-CPU kurulumu için Python bağımlılıklarını yüklemeden önce PyTorch CPU paketlerini kurabilirsiniz:
+For a CPU setup, install the PyTorch CPU packages before installing the Python requirements:
 
 ```bash
 python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ```
 
-Windows'ta sanal ortamı `venv\Scripts\activate` ile etkinleştirin; C++ Build Tools gereklidir. Mevcut `start_system.bat` başlatıcısı kullanılabilir; önce aşağıdaki yönetici hesabı adımını tamamlayın.
+On Windows, activate the virtual environment with `venv\Scripts\activate`; C++ Build Tools are required. You can use the existing `start_system.bat` launcher after creating the administrator account below.
 
-## İlk yönetici hesabı
+## First administrator account
 
-Varsayılan kullanıcı veya parola bulunmaz. Arka uçla aynı çalışma dizininde ve aynı ortam değişkenleriyle çalıştırın:
+There is no default username or password. Run this command from the same working directory and with the same environment variables as the backend:
 
 ```bash
 python manage_users.py create-admin --username vahapogut
 ```
 
-Parola terminalde gizli olarak iki kez istenir; en az 12 karakter gerekir. Diğer hesaplar Kullanıcılar ekranından oluşturulur.
+The terminal prompts twice for a password using hidden input. At least 12 characters are required. Create additional accounts from the Users page.
 
 ```bash
 python manage_users.py reset-password --username vahapogut
 ```
 
-Parola, rol veya etkinlik durumu değiştiğinde mevcut oturumlar iptal edilir. Son etkin yönetici devre dışı bırakılamaz veya daha düşük bir role geçirilemez.
+Changing an account's password, role, or active status revokes its existing sessions. The last active administrator cannot be disabled or demoted.
 
-| Rol | İzinler |
+| Role | Permissions |
 | --- | --- |
-| Yönetici | Tüm ekranlar; kamera, algılama, yüz, kullanıcı ve sistem ayarları; kanıt temizliği |
-| Operatör | Canlı yayın ve olayları görme, dışa aktarma, inceleme/not/arşiv işlemleri |
-| Gözlemci | Canlı yayın, olaylar, kanıtlar ve istatistikleri görme; CSV dışa aktarma |
+| Administrator | All pages; camera, detection, face, user, and system settings; evidence cleanup |
+| Operator | View live feeds and events; export, review, annotate, and archive events |
+| Viewer | View live feeds, events, evidence, and statistics; export CSV |
 
-## Çalıştırma
+## Running the application
 
-İki terminal kullanın:
+Use two terminals:
 
 ```bash
-# Depo kökünde, Python sanal ortamı etkinleştirilmişken
+# From the repository root, with the Python virtual environment activated
 python backend.py
 ```
 
@@ -87,13 +87,13 @@ cd dashboard
 npm run dev
 ```
 
-Panel 3000, arka uç 8000 portunu kullanır. Tarayıcıdaki API ve WebSocket istekleri aynı kökendeki `/api` yolu üzerinden iletilir. Arka uç varsayılan olarak yalnızca `127.0.0.1` üzerinde dinler. Fiziksel kamera yoksa panelde sinyal yok görüntüsü beklenir; bağlı olmayan kamera otomatik olarak yeniden denenir.
+The dashboard uses port 3000 and the backend uses port 8000. Browser API and WebSocket requests are proxied through the same-origin `/api` path. The backend listens on `127.0.0.1` by default. Without a physical camera, the dashboard displays a no-signal frame while connection attempts continue automatically.
 
-Aynı veri dizini için tek arka uç süreci çalıştırın. Yeniden başlatıldığında yarıda kalan klipler başarısız olarak işaretlenir; mevcut kanıt dosyaları korunur. Kamera yapılandırması bozuksa dosyanın üzerine yazılmaz; `cameras.json` düzeltildikten sonra uygulamayı yeniden başlatın.
+Run only one backend process per data directory. On restart, interrupted clips are marked as failed while existing evidence files are preserved. An invalid camera configuration is protected from being overwritten; repair `cameras.json` and restart the application.
 
-### Verileri ayrı bir dizinde saklama
+### Using a separate data directory
 
-`THEFTGUARD_DATA_DIR` ayarları, kamera tanımlarını, olay veritabanını ve kanıt dosyalarını taşır. Yönetici oluşturma komutunda da aynı değişkeni kullanın. Model dosyaları varsayılan olarak depo kökünden okunur.
+`THEFTGUARD_DATA_DIR` sets the location of settings, camera definitions, the event database, and evidence files. Use the same variable when creating the administrator account. Model files are loaded from the repository root by default.
 
 ```bash
 export THEFTGUARD_DATA_DIR="$PWD/data/runtime"
@@ -101,38 +101,38 @@ python manage_users.py create-admin --username vahapogut
 python backend.py
 ```
 
-Ayrı veri dizini belirtilmezse mevcut çalışma dizini kullanılır. Eski dört sütunlu `alerts` tablosu kayıtlar korunarak otomatik genişletilir. Eski kayıtların kamera bilgisi bulunmadığından bu alanlar boş kalabilir.
+The current working directory is used when no data directory is specified. Legacy four-column `alerts` tables are automatically migrated without discarding records. Camera fields may remain empty for older records that lack this information.
 
-### Ortam değişkenleri
+### Environment variables
 
-| Değişken | Varsayılan / amaç |
+| Variable | Default / purpose |
 | --- | --- |
-| `THEFTGUARD_DATA_DIR` | Çalışma dizini; ayarlar, olay veritabanı ve kanıtlar |
-| `THEFTGUARD_MODEL_DIR` | Depo kökü; YOLO model dosyaları |
-| `AUTH_DB_PATH` | Veri dizini altında `data/auth.sqlite3`; isteğe bağlı kullanıcı veritabanı yolu |
+| `THEFTGUARD_DATA_DIR` | Current working directory; settings, event database, and evidence |
+| `THEFTGUARD_MODEL_DIR` | Repository root; YOLO model files |
+| `AUTH_DB_PATH` | `data/auth.sqlite3` under the data directory; optional account database override |
 | `BIND_HOST`, `PORT` | `127.0.0.1`, `8000` |
-| `BACKEND_URL` | Next.js sunucusunun arka uç adresi; `http://127.0.0.1:8000` |
-| `NEXT_PUBLIC_API_URL` | Boş bırakıldığında aynı kökendeki `/api`; ayrı dağıtım için isteğe bağlı |
-| `ALLOWED_ORIGINS` | Virgülle ayrılmış izinli tarayıcı kökenleri; varsayılan `http://localhost:3000,http://127.0.0.1:3000` |
-| `SESSION_COOKIE_SECURE` | Yerelde `false`; HTTPS dağıtımında `true` |
-| `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN` | Bildirimler etkinleştirildiğinde gerekli gizli değerler |
+| `BACKEND_URL` | Backend address used by the Next.js server; `http://127.0.0.1:8000` |
+| `NEXT_PUBLIC_API_URL` | Same-origin `/api` when empty; optional override for a separate API deployment |
+| `ALLOWED_ORIGINS` | Comma-separated allowed browser origins; default `http://localhost:3000,http://127.0.0.1:3000` |
+| `SESSION_COOKIE_SECURE` | `false` locally; set to `true` for HTTPS deployments |
+| `SMTP_PASSWORD`, `TELEGRAM_BOT_TOKEN` | Secrets required when the corresponding notifications are enabled |
 
-Uzak erişimde HTTPS kullanın, `ALLOWED_ORIGINS` değerini gerçek panel kökeniyle ayarlayın ve güvenli oturum çerezlerini etkinleştirin. Kamera kaynak adresleri API yanıtlarında gizlenir. Bildirim parolaları JSON ayar dosyasında veya API yanıtlarında açık olarak tutulmaz.
+For remote access, use HTTPS, set `ALLOWED_ORIGINS` to the actual dashboard origin, and enable secure session cookies. Camera source addresses are redacted in API responses. Notification credentials are not exposed in API responses or stored in the JSON settings file by the settings API.
 
-## Olay ve saklama akışı
+## Event review and retention
 
-Geçmiş ekranında olayları süzün; bir olayı incelendi veya yanlış alarm olarak işaretleyin, not ekleyin ve korunması gereken kanıtı arşivleyin. CSV dışa aktarımı yalnızca görünen sayfayı değil tüm filtrelenmiş sonuçları içerir.
+Filter events on the History page, mark them as reviewed or false alarms, add notes, and archive evidence that should be protected. CSV exports include all matching records across every page.
 
-Ayarlar ekranında klibin alarm öncesi/sonrası süresini seçin. Kamera sayısı, klip kuyruğu ve bellek tamponu sınırlıdır; kaynak doluluğu veya kodlayıcı eksikliği sessiz bir başarılı kayıt olarak gösterilmez.
+Choose pre-event and post-event clip durations in Settings. Camera counts, the recording queue, and memory buffers are bounded. Capacity limits or a missing encoder are reported instead of being presented as successful recordings.
 
-Saklama temizliği otomatik çalışmaz. Önce yaş sınırıyla önizleme alın, ardından silmeyi onaylayın. Önizleme 10 dakika geçerlidir ve bir kez kullanılabilir. Aday kayıtlar veya dosyalar değişmişse yeni önizleme gerekir. Arşivlenmiş olaylar, paylaşılan kanıt dosyaları ve hazırlanmakta olan klipler korunur.
+Retention cleanup is manual. Preview records older than the selected age, then confirm deletion. A preview is valid for 10 minutes and can be used once. Changes to candidate records or files require a new preview. Archived events, shared evidence files, and clips being prepared are protected.
 
-Gizlilik maskesi değiştirildiğinde o kameranın eski klip tamponu ve tamamlanmamış klipleri temizlenir. Önceden tamamlanmış kanıt dosyaları geriye dönük değiştirilmez.
+Updating a camera's privacy masks clears its previous clip buffer and cancels unfinished clips. Previously completed evidence files are not modified retroactively.
 
-## Doğrulama
+## Validation
 
 ```bash
-# Depo kökünde
+# From the repository root
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 python test_setup.py
@@ -144,12 +144,12 @@ npx tsc --noEmit
 npm run build
 ```
 
-Eski `test_setup.py` ve `test_pose.py` hata yakaladığında sıfır çıkış kodu verebilir; çıktıda `SETUP_SUCCESS` ve `Model loaded successfully` işaretlerini de kontrol edin. Yeni testler geçici veritabanları, sentetik kameralar ve sahte bildirim istemcileri kullanır; dışarıya bildirim göndermez.
+The legacy `test_setup.py` and `test_pose.py` scripts may return exit code zero after catching an error. Also check their output for `SETUP_SUCCESS` and `Model loaded successfully`. The new tests use temporary databases, synthetic cameras, and mocked notification clients; they send no external notifications.
 
-## Katkıda bulunanlar
+## Contributors
 
 - [vahapogut](https://github.com/vahapogut)
 
-## Lisans
+## License
 
 [MIT](LICENSE)

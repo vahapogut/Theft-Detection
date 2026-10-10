@@ -1,15 +1,15 @@
 # TheftGuard Dashboard
 
-Next.js 16 ve React 19 paneli. Kurulum, kullanıcı oluşturma ve sunucu yapılandırması için [ana README](../README.md) dosyasını okuyun.
+Dashboard built with Next.js 16 and React 19. See the [main README](../README.md) for installation, account creation, and server configuration.
 
 ```bash
 npm ci
 npm run dev
 ```
 
-Tarayıcı istekleri varsayılan olarak `/api` üzerinden FastAPI sunucusuna iletilir. `BACKEND_URL` sunucu hedefini; isteğe bağlı `NEXT_PUBLIC_API_URL` ayrı API dağıtımını belirler. Oturum çerezi API, WebSocket ve kanıt erişiminde kullanılır. İlk yönetici hesabı sunucu terminalinden oluşturulur.
+Browser requests are forwarded to the FastAPI server through `/api` by default. `BACKEND_URL` sets the backend destination; the optional `NEXT_PUBLIC_API_URL` supports a separately deployed API. A session cookie controls access to the API, WebSocket streams, and evidence. Create the first administrator account from the server terminal.
 
-Ekranlar: canlı görüntü ve istatistikler, kamera sağlığı/bölgeler/maskeler, yüz listeleri, olay inceleme, sistem ayarları ve yöneticiye özel kullanıcı yönetimi. Yazı tipleri yereldir; derleme sırasında harici font indirilmez.
+Pages include live video and statistics, camera health, zones and privacy masks, face lists, event review, system settings, and user management for administrators. Fonts are local; builds do not download external fonts.
 
 ```bash
 npm run lint
@@ -18,6 +18,6 @@ npm run build
 npm run start
 ```
 
-## Katkıda bulunanlar
+## Contributors
 
 - [vahapogut](https://github.com/vahapogut)
